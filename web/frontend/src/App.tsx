@@ -1,259 +1,253 @@
-import { useState, useRef, useCallback } from "react";
-import "./App.css";
+import { useState, useCallback, useRef } from "react";
+import {
+  LiveKitRoom,
+  RoomAudioRenderer,
+  useConnectionState,
+  useTracks,
+  useRemoteParticipants,
+  useDataChannel,
+} from "@livekit/components-react";
+import { ConnectionState, Track } from "livekit-client";
+import "@livekit/components-styles";
+import "./index.css";
 
-function App() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false); // When AGENT is speaking
-  const [status, setStatus] = useState<
-    "idle" | "connecting" | "connected" | "error"
-  >("idle");
+interface TokenData {
+  token: string;
+  room: string;
+  url: string;
+}
 
-  const socketRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const nextStartTimeRef = useRef(0);
+interface AudioMessage {
+  type: "audio" | "text";
+  audio?: string; // base64
+  sampleRate?: number;
+  text?: string;
+}
 
-  const floatTo16BitPCM = (input: Float32Array): ArrayBuffer => {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+function VoiceUI() {
+  const connectionState = useConnectionState();
+  const localTracks = useTracks([Track.Source.Microphone]);
+  const remoteParticipants = useRemoteParticipants();
+  const isConnected = connectionState === ConnectionState.Connected;
+
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [agentText, setAgentText] = useState<string>("");
+
+  // Audio playback using Audio element (better for streaming MP3)
+  const audioQueueRef = useRef<string[]>([]);
+  const isPlayingRef = useRef(false);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Handle data channel messages on 'audio' topic
+  useDataChannel("audio", (msg) => {
+    try {
+      const data: AudioMessage = JSON.parse(
+        new TextDecoder().decode(msg.payload)
+      );
+
+      if (data.type === "text" && data.text) {
+        setAgentText(data.text);
+        console.log("Agent text:", data.text);
+      }
+
+      if (data.type === "audio" && data.audio) {
+        console.log("Received audio data:", data.audio.length, "chars base64");
+        // Add to queue and play
+        audioQueueRef.current.push(data.audio);
+        if (!isPlayingRef.current) {
+          playNextInQueue();
+        }
+      }
+    } catch (e) {
+      console.error("Failed to parse data channel message:", e);
     }
-    return output.buffer;
+  });
+
+  // Play MP3 audio using Audio element
+  const playNextInQueue = () => {
+    if (audioQueueRef.current.length === 0) {
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+      return;
+    }
+
+    isPlayingRef.current = true;
+    setIsPlaying(true);
+
+    const base64Audio = audioQueueRef.current.shift()!;
+
+    // Create audio element with data URL
+    const audio = new Audio(`data:audio/mpeg;base64,${base64Audio}`);
+    currentAudioRef.current = audio;
+
+    audio.onended = () => {
+      console.log("Audio chunk finished");
+      playNextInQueue();
+    };
+
+    audio.onerror = (e) => {
+      console.error("Audio playback error:", e);
+      playNextInQueue();
+    };
+
+    audio
+      .play()
+      .then(() => {
+        console.log("Playing audio chunk");
+      })
+      .catch((e) => {
+        console.error("Failed to play audio:", e);
+        playNextInQueue();
+      });
   };
 
-  const playAudioChunk = useCallback(async (arrayBuffer: ArrayBuffer) => {
-    if (!audioContextRef.current) return;
+  return (
+    <div className="flex flex-col items-center justify-center gap-6">
+      {/* Connection Status */}
+      <div className="text-center text-sm">
+        <span className={isConnected ? "text-green-400" : "text-yellow-400"}>
+          {isConnected ? "● Connected" : "○ " + connectionState}
+        </span>
+        {remoteParticipants.length > 0 && (
+          <span className="ml-2 text-blue-400">
+            • Agent: {remoteParticipants[0]?.identity}
+          </span>
+        )}
+      </div>
 
-    // Agent is speaking!
-    setIsSpeaking(true);
+      {/* Voice Visualizer Orb */}
+      <div className="relative w-40 h-40 flex items-center justify-center">
+        <div
+          className={`absolute inset-0 rounded-full transition-all duration-500 ${
+            isPlaying
+              ? "bg-gradient-to-br from-green-500 to-emerald-500 shadow-2xl shadow-green-500/40 animate-pulse"
+              : isConnected
+              ? "bg-gradient-to-br from-blue-500 to-cyan-500 shadow-2xl shadow-blue-500/40"
+              : "bg-gradient-to-br from-slate-600 to-slate-700"
+          }`}
+        />
+        <div className="relative z-10">
+          <div className="w-10 h-10 text-white/80">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+              <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
+            </svg>
+          </div>
+        </div>
+      </div>
 
-    if (arrayBuffer.byteLength % 2 !== 0) {
-      arrayBuffer = arrayBuffer.slice(0, arrayBuffer.byteLength - 1);
-    }
+      {/* Status Text */}
+      <div className="text-center">
+        <p className="text-lg text-white/80">
+          {isPlaying
+            ? "Speaking..."
+            : isConnected
+            ? "Listening..."
+            : "Connecting..."}
+        </p>
+      </div>
 
-    const data = new Int16Array(arrayBuffer);
-    const float32 = new Float32Array(data.length);
-    for (let i = 0; i < data.length; i++) float32[i] = data[i] / 32768;
+      {/* Agent Response */}
+      {agentText && (
+        <div className="max-w-md p-4 bg-slate-800/50 rounded-lg">
+          <p className="text-sm text-white/70">{agentText}</p>
+        </div>
+      )}
 
-    const buffer = audioContextRef.current.createBuffer(
-      1,
-      float32.length,
-      16000
-    );
-    buffer.getChannelData(0).set(float32);
+      {/* Debug Info */}
+      <div className="mt-4 p-3 bg-slate-800 rounded-lg max-w-md w-full">
+        <p className="text-xs text-white/60 font-mono">
+          🔊 Audio: {isPlaying ? "Playing" : "Idle"} | Queue:{" "}
+          {audioQueueRef.current?.length || 0} | Tracks: {localTracks.length}
+        </p>
+      </div>
+    </div>
+  );
+}
 
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioContextRef.current.destination);
+function App() {
+  const [tokenData, setTokenData] = useState<TokenData | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-    const currentTime = audioContextRef.current.currentTime;
-    if (nextStartTimeRef.current < currentTime) {
-      nextStartTimeRef.current = currentTime;
-    }
-    source.start(nextStartTimeRef.current);
+  const connect = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      setError(null);
 
-    // Set speaking to false after this chunk finishes
-    const duration = buffer.duration * 1000;
-    setTimeout(() => {
-      if (
-        audioContextRef.current &&
-        nextStartTimeRef.current <= audioContextRef.current.currentTime + 0.1
-      ) {
-        setIsSpeaking(false);
+      const response = await fetch("/api/livekit/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to get connection token");
       }
-    }, duration + 100);
 
-    nextStartTimeRef.current += buffer.duration;
+      const data = await response.json();
+      setTokenData(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Connection failed");
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
 
-  const startCall = useCallback(async () => {
-    try {
-      setStatus("connecting");
-
-      const ws = new WebSocket(`ws://${window.location.host}/ws`);
-      socketRef.current = ws;
-
-      ws.onopen = async () => {
-        setStatus("connected");
-        setIsConnected(true);
-
-        audioContextRef.current = new AudioContext({ sampleRate: 16000 });
-        nextStartTimeRef.current = audioContextRef.current.currentTime;
-
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        mediaStreamRef.current = stream;
-
-        const source = audioContextRef.current.createMediaStreamSource(stream);
-        processorRef.current = audioContextRef.current.createScriptProcessor(
-          4096,
-          1,
-          1
-        );
-        source.connect(processorRef.current);
-        processorRef.current.connect(audioContextRef.current.destination);
-
-        processorRef.current.onaudioprocess = (e) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            const pcmData = floatTo16BitPCM(e.inputBuffer.getChannelData(0));
-            ws.send(pcmData);
-          }
-        };
-
-        ws.send(JSON.stringify({ type: "hello" }));
-      };
-
-      ws.onmessage = async (event) => {
-        if (event.data instanceof Blob) {
-          const buffer = await event.data.arrayBuffer();
-          playAudioChunk(buffer);
-        }
-      };
-
-      ws.onclose = () => {
-        setIsConnected(false);
-        setIsSpeaking(false);
-        setStatus("idle");
-      };
-
-      ws.onerror = () => setStatus("error");
-    } catch (err) {
-      console.error(err);
-      setStatus("error");
-    }
-  }, [playAudioChunk]);
-
-  const endCall = useCallback(() => {
-    socketRef.current?.close();
-    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
-    audioContextRef.current?.close();
-    setIsConnected(false);
-    setIsSpeaking(false);
-    setStatus("idle");
+  const disconnect = useCallback(() => {
+    setTokenData(null);
   }, []);
 
   return (
-    <div className="flex flex-col items-center justify-center h-screen bg-gradient-to-b from-slate-950 to-slate-900">
-      {/* Logo */}
-      <div className="mb-8 text-center">
-        <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center">
-          <svg
-            className="w-8 h-8 text-white"
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
+    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 flex flex-col items-center justify-center p-8">
+      {/* Header */}
+      <div className="text-center mb-8">
+        <h1 className="text-3xl font-bold text-white mb-2">
+          Medicare Voice Assistant
+        </h1>
+        <p className="text-slate-400 text-sm">Powered by LiveKit</p>
+      </div>
+
+      {/* Main Content */}
+      {!tokenData && !isLoading && (
+        <div className="flex flex-col items-center gap-6">
+          <button
+            onClick={connect}
+            className="px-8 py-4 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-full shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 hover:scale-105 transition-all duration-300"
           >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"
-            />
-          </svg>
+            Start Conversation
+          </button>
+          {error && <p className="text-red-400 text-sm">{error}</p>}
         </div>
-        <h1 className="text-2xl font-bold text-white">Medicare Services</h1>
-        <p className="text-slate-400 text-sm mt-1">Voice Assistant</p>
-      </div>
+      )}
 
-      {/* Voice Orb - Glows only when AGENT is speaking */}
-      <button
-        onClick={isConnected ? endCall : startCall}
-        className={`relative w-32 h-32 rounded-full transition-all duration-500 ${
-          isSpeaking
-            ? "bg-gradient-to-br from-blue-500 to-cyan-500 shadow-2xl shadow-blue-500/40 scale-110"
-            : isConnected
-            ? "bg-gradient-to-br from-slate-600 to-slate-700"
-            : "bg-gradient-to-br from-slate-700 to-slate-800 hover:from-blue-600 hover:to-cyan-600 hover:scale-105"
-        }`}
-      >
-        {/* Pulse rings only when agent is speaking */}
-        {isSpeaking && (
-          <>
-            <span className="absolute inset-0 rounded-full bg-blue-500/30 animate-ping" />
-            <span className="absolute inset-[-8px] rounded-full border-2 border-blue-400/30 animate-pulse" />
-            <span
-              className="absolute inset-[-16px] rounded-full border border-blue-400/20 animate-pulse"
-              style={{ animationDelay: "0.5s" }}
-            />
-          </>
-        )}
-
-        <svg
-          className="w-12 h-12 text-white absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"
-          fill="none"
-          stroke="currentColor"
-          viewBox="0 0 24 24"
-        >
-          {isConnected ? (
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
-            />
-          ) : (
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-            />
-          )}
-        </svg>
-      </button>
-
-      {/* Status */}
-      <div className="mt-8 text-center">
-        <div
-          className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium ${
-            isSpeaking
-              ? "bg-blue-500/20 text-blue-400"
-              : status === "connected"
-              ? "bg-emerald-500/20 text-emerald-400"
-              : status === "connecting"
-              ? "bg-yellow-500/20 text-yellow-400"
-              : status === "error"
-              ? "bg-red-500/20 text-red-400"
-              : "bg-slate-800 text-slate-400"
-          }`}
-        >
-          <span
-            className={`w-2 h-2 rounded-full ${
-              isSpeaking
-                ? "bg-blue-400 animate-pulse"
-                : status === "connected"
-                ? "bg-emerald-400"
-                : status === "connecting"
-                ? "bg-yellow-400 animate-pulse"
-                : status === "error"
-                ? "bg-red-400"
-                : "bg-slate-500"
-            }`}
-          />
-          {isSpeaking
-            ? "Speaking..."
-            : status === "connected"
-            ? "Listening..."
-            : status === "connecting"
-            ? "Connecting..."
-            : status === "error"
-            ? "Error"
-            : "Tap to speak"}
+      {isLoading && (
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
+          <p className="text-white/60">Getting room token...</p>
         </div>
-      </div>
+      )}
 
-      {/* Hint */}
-      <p className="mt-12 text-slate-600 text-sm max-w-xs text-center">
-        I can help you book appointments, answer questions about doctors, or
-        assist with prescriptions.
-      </p>
+      {tokenData && (
+        <LiveKitRoom
+          serverUrl={tokenData.url}
+          token={tokenData.token}
+          connect={true}
+          audio={true}
+          video={false}
+          onDisconnected={disconnect}
+          className="flex flex-col items-center gap-6"
+        >
+          <VoiceUI />
+          <RoomAudioRenderer />
+
+          <button
+            onClick={disconnect}
+            className="mt-4 px-6 py-2 border border-red-500/50 text-red-400 rounded-full hover:bg-red-500/10 transition-colors"
+          >
+            End Conversation
+          </button>
+        </LiveKitRoom>
+      )}
     </div>
   );
 }

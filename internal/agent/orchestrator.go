@@ -110,7 +110,7 @@ func (o *Orchestrator) processTranscriptsHybrid() {
 	var mu sync.Mutex
 	var processingTimer *time.Timer
 
-	const additionalWait = 500 * time.Millisecond // Extra wait after UtteranceEnd
+	const additionalWait = 10 * time.Millisecond // Extra wait after UtteranceEnd
 
 	processFn := func() {
 		mu.Lock()

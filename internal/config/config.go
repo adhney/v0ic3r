@@ -12,6 +12,11 @@ type Config struct {
 	DeepgramAPIKey   string
 	GeminiAPIKey     string
 	ElevenLabsAPIKey string
+
+	// LiveKit
+	LiveKitURL       string
+	LiveKitAPIKey    string
+	LiveKitAPISecret string
 }
 
 func LoadConfig() (*Config, error) {
@@ -24,6 +29,9 @@ func LoadConfig() (*Config, error) {
 		DeepgramAPIKey:   getEnv("DEEPGRAM_API_KEY", ""),
 		GeminiAPIKey:     getEnv("GEMINI_API_KEY", ""),
 		ElevenLabsAPIKey: getEnv("ELEVENLABS_API_KEY", ""),
+		LiveKitURL:       getEnv("LIVEKIT_URL", "ws://localhost:7880"),
+		LiveKitAPIKey:    getEnv("LIVEKIT_API_KEY", "devkey"),
+		LiveKitAPISecret: getEnv("LIVEKIT_API_SECRET", "secret"),
 	}, nil
 }
 

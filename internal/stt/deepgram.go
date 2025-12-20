@@ -33,8 +33,8 @@ func (d *DeepgramClient) Connect(ctx context.Context) error {
 		Model:          "nova-3",
 		Language:       "en-US",
 		SmartFormat:    true,
-		Encoding:       "linear16",
-		SampleRate:     16000,
+		Encoding:       "opus", // LiveKit sends Opus-encoded audio
+		SampleRate:     48000,  // WebRTC default for Opus
 		Channels:       1,
 		InterimResults: true,
 		UtteranceEndMs: "1000", // Deepgram fires UtteranceEnd after 1s of silence

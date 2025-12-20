@@ -41,7 +41,7 @@ func (e *ElevenLabsClient) SendText(text string) error {
 }
 
 func (e *ElevenLabsClient) speakAsync(text string) {
-	url := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/stream-input?model_id=%s&output_format=pcm_16000", e.voiceID, e.modelID)
+	url := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/stream-input?model_id=%s&output_format=mp3_44100_128", e.voiceID, e.modelID)
 
 	header := http.Header{}
 	header.Set("xi-api-key", e.apiKey)
@@ -74,9 +74,16 @@ func (e *ElevenLabsClient) speakAsync(text string) {
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			// Connection closed or error - we're done
+			log.Printf("DEBUG: ElevenLabs read error: %v", err)
 			break
 		}
+
+		// Log raw message (truncated)
+		msgStr := string(message)
+		if len(msgStr) > 200 {
+			msgStr = msgStr[:200] + "..."
+		}
+		log.Printf("DEBUG: ElevenLabs raw: %s", msgStr)
 
 		var response struct {
 			Audio   string `json:"audio"`
@@ -84,6 +91,7 @@ func (e *ElevenLabsClient) speakAsync(text string) {
 		}
 
 		if err := json.Unmarshal(message, &response); err != nil {
+			log.Printf("DEBUG: JSON unmarshal error: %v", err)
 			continue
 		}
 
@@ -93,23 +101,28 @@ func (e *ElevenLabsClient) speakAsync(text string) {
 				log.Printf("Base64 decode error: %v", err)
 				continue
 			}
+			log.Printf("DEBUG: TTS audio decoded %d bytes", len(decoded))
 			e.audioChan <- decoded
 		}
 
 		if response.IsFinal {
+			log.Printf("DEBUG: TTS response is final")
 			break
 		}
 	}
+	log.Printf("DEBUG: speakAsync completed")
 }
 
 // ReceiveAudio returns the channel where audio chunks are sent
 func (e *ElevenLabsClient) ReceiveAudio(ctx context.Context, audioChan chan<- []byte) {
+	log.Printf("DEBUG: ReceiveAudio started")
 	for {
 		select {
 		case <-ctx.Done():
 			close(audioChan)
 			return
 		case chunk := <-e.audioChan:
+			log.Printf("DEBUG: Forwarding audio chunk %d bytes to agent", len(chunk))
 			audioChan <- chunk
 		}
 	}

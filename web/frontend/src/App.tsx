@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -33,10 +33,11 @@ function VoiceUI() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [agentText, setAgentText] = useState<string>("");
 
-  // Audio playback using Audio element (better for streaming MP3)
-  const audioQueueRef = useRef<string[]>([]);
+  // Buffer for accumulating audio chunks (as binary)
+  const audioBufferRef = useRef<Uint8Array[]>([]);
+  const playbackQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const playbackTimeoutRef = useRef<number | null>(null);
 
   // Handle data channel messages on 'audio' topic
   useDataChannel("audio", (msg) => {
@@ -51,21 +52,66 @@ function VoiceUI() {
       }
 
       if (data.type === "audio" && data.audio) {
-        console.log("Received audio data:", data.audio.length, "chars base64");
-        // Add to queue and play
-        audioQueueRef.current.push(data.audio);
-        if (!isPlayingRef.current) {
-          playNextInQueue();
+        console.log("Received audio chunk:", data.audio.length, "chars");
+
+        // Decode base64 to binary and buffer
+        const binaryString = atob(data.audio);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
         }
+        audioBufferRef.current.push(bytes);
+
+        // Reset the timeout - we'll play after 300ms of no new chunks
+        if (playbackTimeoutRef.current) {
+          clearTimeout(playbackTimeoutRef.current);
+        }
+
+        playbackTimeoutRef.current = window.setTimeout(() => {
+          // Combine all buffered binary chunks
+          if (audioBufferRef.current.length > 0) {
+            const totalLength = audioBufferRef.current.reduce(
+              (acc, arr) => acc + arr.length,
+              0
+            );
+            const combined = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const chunk of audioBufferRef.current) {
+              combined.set(chunk, offset);
+              offset += chunk.length;
+            }
+
+            console.log("Buffered complete audio:", combined.length, "bytes");
+
+            // Create Blob and queue for playback
+            const blob = new Blob([combined], { type: "audio/mpeg" });
+            const url = URL.createObjectURL(blob);
+            playbackQueueRef.current.push(url);
+            audioBufferRef.current = [];
+
+            if (!isPlayingRef.current) {
+              playNextInQueue();
+            }
+          }
+        }, 300);
       }
     } catch (e) {
       console.error("Failed to parse data channel message:", e);
     }
   });
 
-  // Play MP3 audio using Audio element
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (playbackTimeoutRef.current) {
+        clearTimeout(playbackTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Play combined audio using Audio element
   const playNextInQueue = () => {
-    if (audioQueueRef.current.length === 0) {
+    if (playbackQueueRef.current.length === 0) {
       isPlayingRef.current = false;
       setIsPlaying(false);
       return;
@@ -74,29 +120,32 @@ function VoiceUI() {
     isPlayingRef.current = true;
     setIsPlaying(true);
 
-    const base64Audio = audioQueueRef.current.shift()!;
+    const audioUrl = playbackQueueRef.current.shift()!;
 
-    // Create audio element with data URL
-    const audio = new Audio(`data:audio/mpeg;base64,${base64Audio}`);
-    currentAudioRef.current = audio;
+    // Create audio element with blob URL
+    const audio = new Audio(audioUrl);
 
     audio.onended = () => {
-      console.log("Audio chunk finished");
+      console.log("Audio playback finished");
+      // Revoke the blob URL to free memory
+      URL.revokeObjectURL(audioUrl);
       playNextInQueue();
     };
 
     audio.onerror = (e) => {
       console.error("Audio playback error:", e);
+      URL.revokeObjectURL(audioUrl);
       playNextInQueue();
     };
 
     audio
       .play()
       .then(() => {
-        console.log("Playing audio chunk");
+        console.log("Playing combined audio");
       })
       .catch((e) => {
         console.error("Failed to play audio:", e);
+        URL.revokeObjectURL(audioUrl);
         playNextInQueue();
       });
   };
@@ -157,8 +206,8 @@ function VoiceUI() {
       {/* Debug Info */}
       <div className="mt-4 p-3 bg-slate-800 rounded-lg max-w-md w-full">
         <p className="text-xs text-white/60 font-mono">
-          🔊 Audio: {isPlaying ? "Playing" : "Idle"} | Queue:{" "}
-          {audioQueueRef.current?.length || 0} | Tracks: {localTracks.length}
+          🔊 Audio: {isPlaying ? "Playing" : "Idle"} | Buffer:{" "}
+          {audioBufferRef.current?.length || 0} | Tracks: {localTracks.length}
         </p>
       </div>
     </div>

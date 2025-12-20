@@ -10,17 +10,17 @@ import (
 )
 
 type DeepgramClient struct {
-	conn           *client.WSCallback
-	apiKey         string
-	Transcript     chan string
-	UtteranceReady chan bool // Signals when user has finished speaking
+	conn         *client.WSCallback
+	apiKey       string
+	Transcript   chan string
+	UtteranceEnd chan bool // Fires when Deepgram detects end of utterance
 }
 
 func NewDeepgramClient(apiKey string) *DeepgramClient {
 	return &DeepgramClient{
-		apiKey:         apiKey,
-		Transcript:     make(chan string, 100),
-		UtteranceReady: make(chan bool, 10),
+		apiKey:       apiKey,
+		Transcript:   make(chan string, 100),
+		UtteranceEnd: make(chan bool, 10),
 	}
 }
 
@@ -37,7 +37,7 @@ func (d *DeepgramClient) Connect(ctx context.Context) error {
 		SampleRate:     16000,
 		Channels:       1,
 		InterimResults: true,
-		UtteranceEndMs: "1500", // Wait 1.5s of silence before firing UtteranceEnd
+		UtteranceEndMs: "1000", // Deepgram fires UtteranceEnd after 1s of silence
 	}
 
 	callback := &DeepgramReceiver{d: d}
@@ -85,25 +85,21 @@ func (r *DeepgramReceiver) Message(mr *msginterfaces.MessageResponse) error {
 	if len(mr.Channel.Alternatives) > 0 {
 		alt := mr.Channel.Alternatives[0]
 		if len(alt.Transcript) > 0 && mr.IsFinal {
-			// Send final transcript chunks immediately
 			r.d.Transcript <- alt.Transcript
 		}
 	}
 	return nil
 }
 
-func (r *DeepgramReceiver) Metadata(md *msginterfaces.MetadataResponse) error { return nil }
-func (r *DeepgramReceiver) SpeechStarted(ssr *msginterfaces.SpeechStartedResponse) error {
-	return nil
-}
+func (r *DeepgramReceiver) Metadata(md *msginterfaces.MetadataResponse) error            { return nil }
+func (r *DeepgramReceiver) SpeechStarted(ssr *msginterfaces.SpeechStartedResponse) error { return nil }
 
-// UtteranceEnd fires when Deepgram detects the user has stopped speaking
+// UtteranceEnd fires when Deepgram detects a gap >= utterance_end_ms
 func (r *DeepgramReceiver) UtteranceEnd(ur *msginterfaces.UtteranceEndResponse) error {
-	log.Println("UtteranceEnd detected - user finished speaking")
+	log.Println("Deepgram UtteranceEnd detected")
 	select {
-	case r.d.UtteranceReady <- true:
+	case r.d.UtteranceEnd <- true:
 	default:
-		// Channel full, skip
 	}
 	return nil
 }

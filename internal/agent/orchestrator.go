@@ -97,47 +97,29 @@ func (o *Orchestrator) Start() error {
 		}
 	}()
 
-	// Process transcripts with UtteranceEnd-based buffering
-	go o.processTranscripts()
+	// Process transcripts with hybrid debounce:
+	// - Deepgram's UtteranceEnd signals potential end (1s silence)
+	// - We wait an additional 500ms to catch any continuation
+	go o.processTranscriptsHybrid()
 
 	return <-errChan
 }
 
-func (o *Orchestrator) processTranscripts() {
+func (o *Orchestrator) processTranscriptsHybrid() {
 	var buffer strings.Builder
 	var mu sync.Mutex
+	var processingTimer *time.Timer
 
-	// Collect transcripts into buffer
-	go func() {
-		for transcript := range o.sttClient.Transcript {
-			if transcript == "" {
-				continue
-			}
+	const additionalWait = 500 * time.Millisecond // Extra wait after UtteranceEnd
 
-			// Show in UI immediately
-			o.wsConn.WriteJSON(map[string]string{"role": "user", "text": transcript})
-
-			mu.Lock()
-			if buffer.Len() > 0 {
-				buffer.WriteString(" ")
-			}
-			buffer.WriteString(transcript)
-			mu.Unlock()
-		}
-	}()
-
-	// Wait for UtteranceEnd to process the buffered text
-	for range o.sttClient.UtteranceReady {
-		// Small delay to ensure last transcript is captured
-		time.Sleep(100 * time.Millisecond)
-
+	processFn := func() {
 		mu.Lock()
 		fullUtterance := strings.TrimSpace(buffer.String())
 		buffer.Reset()
 		mu.Unlock()
 
 		if fullUtterance == "" {
-			continue
+			return
 		}
 
 		log.Printf("Processing complete utterance: %s", fullUtterance)
@@ -145,7 +127,7 @@ func (o *Orchestrator) processTranscripts() {
 		responseStream, err := o.llmClient.GenerateResponse(o.ctx, fullUtterance)
 		if err != nil {
 			log.Printf("LLM Error: %v", err)
-			continue
+			return
 		}
 
 		var fullResponse string
@@ -160,6 +142,39 @@ func (o *Orchestrator) processTranscripts() {
 				log.Printf("TTS Send Error: %v", err)
 			}
 		}
+	}
+
+	// Goroutine to collect transcripts
+	go func() {
+		for transcript := range o.sttClient.Transcript {
+			if transcript == "" {
+				continue
+			}
+
+			mu.Lock()
+			if buffer.Len() > 0 {
+				buffer.WriteString(" ")
+			}
+			buffer.WriteString(transcript)
+			mu.Unlock()
+
+			// If timer was running, stop it (we got more speech)
+			if processingTimer != nil {
+				processingTimer.Stop()
+				processingTimer = nil
+			}
+		}
+	}()
+
+	// Listen for UtteranceEnd signals from Deepgram
+	for range o.sttClient.UtteranceEnd {
+		// Cancel any existing timer
+		if processingTimer != nil {
+			processingTimer.Stop()
+		}
+
+		// Wait a bit more to catch late transcripts
+		processingTimer = time.AfterFunc(additionalWait, processFn)
 	}
 }
 

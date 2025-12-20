@@ -1,15 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useRef, useCallback } from "react";
 import "./App.css";
-
-interface Message {
-  role: "user" | "agent";
-  text: string;
-}
 
 function App() {
   const [isConnected, setIsConnected] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [isSpeaking, setIsSpeaking] = useState(false); // When AGENT is speaking
   const [status, setStatus] = useState<
     "idle" | "connecting" | "connected" | "error"
   >("idle");
@@ -19,15 +13,6 @@ function App() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const nextStartTimeRef = useRef(0);
-  const transcriptRef = useRef<HTMLDivElement>(null);
-  const lastAudioTimeRef = useRef(Date.now());
-  const agentTextQueueRef = useRef("");
-
-  const scrollToBottom = useCallback(() => {
-    if (transcriptRef.current) {
-      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
-    }
-  }, []);
 
   const floatTo16BitPCM = (input: Float32Array): ArrayBuffer => {
     const output = new Int16Array(input.length);
@@ -40,7 +25,9 @@ function App() {
 
   const playAudioChunk = useCallback(async (arrayBuffer: ArrayBuffer) => {
     if (!audioContextRef.current) return;
-    lastAudioTimeRef.current = Date.now();
+
+    // Agent is speaking!
+    setIsSpeaking(true);
 
     if (arrayBuffer.byteLength % 2 !== 0) {
       arrayBuffer = arrayBuffer.slice(0, arrayBuffer.byteLength - 1);
@@ -66,6 +53,18 @@ function App() {
       nextStartTimeRef.current = currentTime;
     }
     source.start(nextStartTimeRef.current);
+
+    // Set speaking to false after this chunk finishes
+    const duration = buffer.duration * 1000;
+    setTimeout(() => {
+      if (
+        audioContextRef.current &&
+        nextStartTimeRef.current <= audioContextRef.current.currentTime + 0.1
+      ) {
+        setIsSpeaking(false);
+      }
+    }, duration + 100);
+
     nextStartTimeRef.current += buffer.duration;
   }, []);
 
@@ -79,9 +78,7 @@ function App() {
       ws.onopen = async () => {
         setStatus("connected");
         setIsConnected(true);
-        setIsListening(true);
 
-        // Initialize Audio
         audioContextRef.current = new AudioContext({ sampleRate: 16000 });
         nextStartTimeRef.current = audioContextRef.current.currentTime;
 
@@ -110,32 +107,11 @@ function App() {
           }
         };
 
-        // Send ready signal
         ws.send(JSON.stringify({ type: "hello" }));
       };
 
       ws.onmessage = async (event) => {
-        if (typeof event.data === "string") {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.role === "user") {
-              setMessages((prev) => {
-                const last = prev[prev.length - 1];
-                if (last?.role === "user") {
-                  return [
-                    ...prev.slice(0, -1),
-                    { ...last, text: last.text + msg.text },
-                  ];
-                }
-                return [...prev, { role: "user", text: msg.text }];
-              });
-            } else if (msg.role === "agent") {
-              agentTextQueueRef.current += msg.text;
-            }
-          } catch (e) {
-            /* ignore */
-          }
-        } else if (event.data instanceof Blob) {
+        if (event.data instanceof Blob) {
           const buffer = await event.data.arrayBuffer();
           playAudioChunk(buffer);
         }
@@ -143,7 +119,7 @@ function App() {
 
       ws.onclose = () => {
         setIsConnected(false);
-        setIsListening(false);
+        setIsSpeaking(false);
         setStatus("idle");
       };
 
@@ -159,181 +135,125 @@ function App() {
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     audioContextRef.current?.close();
     setIsConnected(false);
-    setIsListening(false);
+    setIsSpeaking(false);
     setStatus("idle");
   }, []);
 
-  // Text sync render loop
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (agentTextQueueRef.current.length > 0 && audioContextRef.current) {
-        const timeSinceAudio = Date.now() - lastAudioTimeRef.current;
-        const isAudioPlaying =
-          nextStartTimeRef.current > audioContextRef.current.currentTime;
-        const forceFlush = timeSinceAudio > 2000;
-
-        if (isAudioPlaying || forceFlush) {
-          const speed = forceFlush ? 5 : 1;
-          const chunk = agentTextQueueRef.current.slice(0, speed);
-          agentTextQueueRef.current = agentTextQueueRef.current.slice(speed);
-
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (last?.role === "agent") {
-              return [
-                ...prev.slice(0, -1),
-                { ...last, text: last.text + chunk },
-              ];
-            }
-            return [...prev, { role: "agent", text: chunk }];
-          });
-        }
-      }
-    }, 16); // ~60fps
-
-    return () => clearInterval(interval);
-  }, []);
-
-  // Auto-scroll
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, scrollToBottom]);
-
   return (
-    <div className="flex flex-col h-screen bg-gradient-to-b from-slate-950 to-slate-900">
-      {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-slate-800/50 bg-slate-900/80 backdrop-blur-sm">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center">
-            <svg
-              className="w-6 h-6 text-white"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"
-              />
-            </svg>
-          </div>
-          <div>
-            <h1 className="text-lg font-semibold text-white">
-              Medicare Services
-            </h1>
-            <p className="text-xs text-slate-400">Voice Assistant</p>
-          </div>
+    <div className="flex flex-col items-center justify-center h-screen bg-gradient-to-b from-slate-950 to-slate-900">
+      {/* Logo */}
+      <div className="mb-8 text-center">
+        <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center">
+          <svg
+            className="w-8 h-8 text-white"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"
+            />
+          </svg>
         </div>
-        <div
-          className={`px-3 py-1.5 rounded-full text-xs font-medium ${
-            status === "connected"
-              ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-              : status === "connecting"
-              ? "bg-yellow-500/20 text-yellow-400 border border-yellow-500/30"
-              : status === "error"
-              ? "bg-red-500/20 text-red-400 border border-red-500/30"
-              : "bg-slate-700/50 text-slate-400 border border-slate-600/30"
-          }`}
-        >
-          {status === "connected"
-            ? "● Connected"
-            : status === "connecting"
-            ? "○ Connecting..."
-            : status === "error"
-            ? "● Error"
-            : "○ Ready"}
-        </div>
-      </header>
+        <h1 className="text-2xl font-bold text-white">Medicare Services</h1>
+        <p className="text-slate-400 text-sm mt-1">Voice Assistant</p>
+      </div>
 
-      {/* Chat Area */}
-      <div ref={transcriptRef} className="flex-1 overflow-y-auto p-6 space-y-4">
-        {messages.length === 0 && !isConnected && (
-          <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
-            <div className="w-20 h-20 rounded-full bg-gradient-to-br from-blue-500/20 to-cyan-500/20 flex items-center justify-center">
-              <svg
-                className="w-10 h-10 text-blue-400"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={1.5}
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                />
-              </svg>
-            </div>
-            <p className="text-slate-500 max-w-md">
-              Tap the button below to speak with your Medicare assistant. I can
-              help with appointments, doctors, and prescriptions.
-            </p>
-          </div>
+      {/* Voice Orb - Glows only when AGENT is speaking */}
+      <button
+        onClick={isConnected ? endCall : startCall}
+        className={`relative w-32 h-32 rounded-full transition-all duration-500 ${
+          isSpeaking
+            ? "bg-gradient-to-br from-blue-500 to-cyan-500 shadow-2xl shadow-blue-500/40 scale-110"
+            : isConnected
+            ? "bg-gradient-to-br from-slate-600 to-slate-700"
+            : "bg-gradient-to-br from-slate-700 to-slate-800 hover:from-blue-600 hover:to-cyan-600 hover:scale-105"
+        }`}
+      >
+        {/* Pulse rings only when agent is speaking */}
+        {isSpeaking && (
+          <>
+            <span className="absolute inset-0 rounded-full bg-blue-500/30 animate-ping" />
+            <span className="absolute inset-[-8px] rounded-full border-2 border-blue-400/30 animate-pulse" />
+            <span
+              className="absolute inset-[-16px] rounded-full border border-blue-400/20 animate-pulse"
+              style={{ animationDelay: "0.5s" }}
+            />
+          </>
         )}
 
-        {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`flex ${
-              msg.role === "user" ? "justify-end" : "justify-start"
-            }`}
-          >
-            <div
-              className={`max-w-[80%] px-4 py-3 rounded-2xl ${
-                msg.role === "user"
-                  ? "bg-blue-600 text-white rounded-tr-sm"
-                  : "bg-slate-800 text-slate-100 rounded-tl-sm border border-slate-700/50"
-              }`}
-            >
-              {msg.text}
-            </div>
-          </div>
-        ))}
-      </div>
+        <svg
+          className="w-12 h-12 text-white absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          {isConnected ? (
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
+            />
+          ) : (
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+            />
+          )}
+        </svg>
+      </button>
 
-      {/* Footer Controls */}
-      <div className="p-6 pt-0">
-        <div className="flex flex-col items-center gap-4">
-          {/* Voice Orb */}
-          <button
-            onClick={isConnected ? endCall : startCall}
-            className={`relative w-20 h-20 rounded-full transition-all duration-300 ${
-              isListening
-                ? "bg-gradient-to-br from-blue-500 to-cyan-500 shadow-lg shadow-blue-500/30 animate-pulse"
-                : "bg-gradient-to-br from-slate-700 to-slate-800 hover:from-blue-600 hover:to-cyan-600"
+      {/* Status */}
+      <div className="mt-8 text-center">
+        <div
+          className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium ${
+            isSpeaking
+              ? "bg-blue-500/20 text-blue-400"
+              : status === "connected"
+              ? "bg-emerald-500/20 text-emerald-400"
+              : status === "connecting"
+              ? "bg-yellow-500/20 text-yellow-400"
+              : status === "error"
+              ? "bg-red-500/20 text-red-400"
+              : "bg-slate-800 text-slate-400"
+          }`}
+        >
+          <span
+            className={`w-2 h-2 rounded-full ${
+              isSpeaking
+                ? "bg-blue-400 animate-pulse"
+                : status === "connected"
+                ? "bg-emerald-400"
+                : status === "connecting"
+                ? "bg-yellow-400 animate-pulse"
+                : status === "error"
+                ? "bg-red-400"
+                : "bg-slate-500"
             }`}
-          >
-            <svg
-              className="w-8 h-8 text-white absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              {isConnected ? (
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
-                />
-              ) : (
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
-                />
-              )}
-            </svg>
-          </button>
-
-          <p className="text-sm text-slate-500">
-            {isConnected ? "Tap to end call" : "Tap to start speaking"}
-          </p>
+          />
+          {isSpeaking
+            ? "Speaking..."
+            : status === "connected"
+            ? "Listening..."
+            : status === "connecting"
+            ? "Connecting..."
+            : status === "error"
+            ? "Error"
+            : "Tap to speak"}
         </div>
       </div>
+
+      {/* Hint */}
+      <p className="mt-12 text-slate-600 text-sm max-w-xs text-center">
+        I can help you book appointments, answer questions about doctors, or
+        assist with prescriptions.
+      </p>
     </div>
   );
 }

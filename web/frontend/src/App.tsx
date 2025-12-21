@@ -18,7 +18,13 @@ interface TokenData {
 }
 
 interface AudioMessage {
-  type: "audio" | "text";
+  type:
+    | "audio"
+    | "text"
+    | "audio_stop"
+    | "audio_start"
+    | "audio_end"
+    | "agent_ready";
   audio?: string; // base64
   sampleRate?: number;
   text?: string;
@@ -32,12 +38,39 @@ function VoiceUI() {
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [agentText, setAgentText] = useState<string>("");
+  const [isAgentReady, setIsAgentReady] = useState(false);
 
   // Buffer for accumulating audio chunks (as binary)
   const audioBufferRef = useRef<Uint8Array[]>([]);
   const playbackQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
   const playbackTimeoutRef = useRef<number | null>(null);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const shouldIgnoreAudioRef = useRef(false); // Set after barge-in to ignore incoming chunks
+
+  // Stop all audio playback (for barge-in)
+  const stopAllAudio = useCallback(() => {
+    console.log("[BARGE-IN] Stopping all audio");
+    // Ignore any incoming audio until next audio_start
+    shouldIgnoreAudioRef.current = true;
+    // Clear buffer
+    audioBufferRef.current = [];
+    // Clear playback queue and revoke URLs
+    playbackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    playbackQueueRef.current = [];
+    // Clear pending timeout
+    if (playbackTimeoutRef.current) {
+      clearTimeout(playbackTimeoutRef.current);
+      playbackTimeoutRef.current = null;
+    }
+    // Stop current audio
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+  }, []);
 
   // Handle data channel messages on 'audio' topic
   useDataChannel("audio", (msg) => {
@@ -46,12 +79,35 @@ function VoiceUI() {
         new TextDecoder().decode(msg.payload)
       );
 
+      if (data.type === "audio_stop") {
+        stopAllAudio();
+        return;
+      }
+
+      if (data.type === "audio_start") {
+        // New audio stream starting, accept audio again
+        shouldIgnoreAudioRef.current = false;
+        return;
+      }
+
+      if (data.type === "agent_ready") {
+        console.log("[AGENT] Agent is ready");
+        setIsAgentReady(true);
+        return;
+      }
+
       if (data.type === "text" && data.text) {
         setAgentText(data.text);
         console.log("Agent text:", data.text);
       }
 
       if (data.type === "audio" && data.audio) {
+        // Ignore audio if we're in barge-in stop mode
+        if (shouldIgnoreAudioRef.current) {
+          console.log("[BARGE-IN] Ignoring audio chunk (stopped)");
+          return;
+        }
+
         console.log("Received audio chunk:", data.audio.length, "chars");
 
         // Decode base64 to binary and buffer
@@ -109,6 +165,49 @@ function VoiceUI() {
     };
   }, []);
 
+  // Local VAD (Voice Activity Detection) for instant barge-in
+  // Monitors microphone level and stops audio when user speaks - no STT delay
+  useEffect(() => {
+    if (!isConnected || localTracks.length === 0) return;
+
+    const track = localTracks[0]?.publication?.track;
+    if (!track || !track.mediaStreamTrack) return;
+
+    const audioContext = new AudioContext();
+    const mediaStream = new MediaStream([track.mediaStreamTrack]);
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+
+    source.connect(analyser);
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    let animationId: number;
+
+    const checkAudioLevel = () => {
+      analyser.getByteFrequencyData(dataArray);
+      const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+      // If user is speaking (level > 30) and we're playing audio, stop immediately
+      // Threshold 30 filters out background noise, adjust if needed
+      if (average > 50 && isPlayingRef.current) {
+        console.log(
+          "[LOCAL-VAD] User speaking detected, stopping audio instantly"
+        );
+        stopAllAudio();
+      }
+
+      animationId = requestAnimationFrame(checkAudioLevel);
+    };
+
+    checkAudioLevel();
+
+    return () => {
+      cancelAnimationFrame(animationId);
+      audioContext.close();
+    };
+  }, [isConnected, localTracks, stopAllAudio]);
+
   // Play combined audio using Audio element
   const playNextInQueue = () => {
     if (playbackQueueRef.current.length === 0) {
@@ -124,6 +223,7 @@ function VoiceUI() {
 
     // Create audio element with blob URL
     const audio = new Audio(audioUrl);
+    currentAudioRef.current = audio;
 
     audio.onended = () => {
       console.log("Audio playback finished");
@@ -190,8 +290,12 @@ function VoiceUI() {
         <p className="text-lg text-white/80">
           {isPlaying
             ? "Speaking..."
-            : isConnected
+            : isAgentReady
             ? "Listening..."
+            : isConnected && remoteParticipants.length > 0
+            ? "Initializing..."
+            : isConnected
+            ? "Connecting to agent..."
             : "Connecting..."}
         </p>
       </div>

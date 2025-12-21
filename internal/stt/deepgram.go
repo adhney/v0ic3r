@@ -3,6 +3,7 @@ package stt
 import (
 	"context"
 	"log"
+	"time"
 
 	msginterfaces "github.com/deepgram/deepgram-go-sdk/pkg/api/listen/v1/websocket/interfaces"
 	interfaces "github.com/deepgram/deepgram-go-sdk/pkg/client/interfaces"
@@ -10,17 +11,19 @@ import (
 )
 
 type DeepgramClient struct {
-	conn         *client.WSCallback
-	apiKey       string
-	Transcript   chan string
-	UtteranceEnd chan bool // Fires when Deepgram detects end of utterance
+	conn          *client.WSCallback
+	apiKey        string
+	Transcript    chan string
+	UtteranceEnd  chan bool // Fires when Deepgram detects end of utterance
+	SpeechStarted chan bool // Fires when Deepgram detects speech start (for barge-in)
 }
 
 func NewDeepgramClient(apiKey string) *DeepgramClient {
 	return &DeepgramClient{
-		apiKey:       apiKey,
-		Transcript:   make(chan string, 100),
-		UtteranceEnd: make(chan bool, 10),
+		apiKey:        apiKey,
+		Transcript:    make(chan string, 100),
+		UtteranceEnd:  make(chan bool, 10),
+		SpeechStarted: make(chan bool, 10),
 	}
 }
 
@@ -85,18 +88,30 @@ func (r *DeepgramReceiver) Message(mr *msginterfaces.MessageResponse) error {
 	if len(mr.Channel.Alternatives) > 0 {
 		alt := mr.Channel.Alternatives[0]
 		if len(alt.Transcript) > 0 && mr.IsFinal {
+			log.Printf("[LATENCY] STT transcript received at %v: %q",
+				time.Now().Format("15:04:05.000"), alt.Transcript)
 			r.d.Transcript <- alt.Transcript
 		}
 	}
 	return nil
 }
 
-func (r *DeepgramReceiver) Metadata(md *msginterfaces.MetadataResponse) error            { return nil }
-func (r *DeepgramReceiver) SpeechStarted(ssr *msginterfaces.SpeechStartedResponse) error { return nil }
+func (r *DeepgramReceiver) Metadata(md *msginterfaces.MetadataResponse) error { return nil }
+
+// SpeechStarted fires when Deepgram detects voice activity starting
+func (r *DeepgramReceiver) SpeechStarted(ssr *msginterfaces.SpeechStartedResponse) error {
+	log.Printf("[BARGE-IN] SpeechStarted detected at %v", time.Now().Format("15:04:05.000"))
+	select {
+	case r.d.SpeechStarted <- true:
+	default:
+		// Channel full, skip
+	}
+	return nil
+}
 
 // UtteranceEnd fires when Deepgram detects a gap >= utterance_end_ms
 func (r *DeepgramReceiver) UtteranceEnd(ur *msginterfaces.UtteranceEndResponse) error {
-	log.Println("Deepgram UtteranceEnd detected")
+	log.Printf("[LATENCY] STT UtteranceEnd detected at %v", time.Now().Format("15:04:05.000"))
 	select {
 	case r.d.UtteranceEnd <- true:
 	default:

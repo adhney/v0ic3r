@@ -35,6 +35,13 @@ type VoiceAgent struct {
 	transcriptBuf strings.Builder
 	debounceTimer *time.Timer
 
+	// Interrupt handling (Vocalis-style barge-in)
+	interruptPlayback bool      // Set when user speaks during TTS
+	isPlaying         bool      // True when TTS audio is being sent
+	lastAudioSentTime time.Time // Track when audio was last sent for smart barge-in
+	isProcessing      bool      // Prevent concurrent LLM/TTS requests
+	cancelRequest     func()    // Cancel current LLM/TTS request on barge-in
+
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
@@ -140,6 +147,9 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 
 		// Start transcript processing
 		go a.processTranscripts()
+
+		// Start SpeechStarted listener for barge-in (Vocalis-style)
+		go a.listenForSpeechStart()
 	}
 
 	if a.ttsClient != nil {
@@ -150,6 +160,10 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 		// Start TTS audio receiver
 		go a.ttsClient.ReceiveAudio(a.ctx, a.ttsAudioChan)
 	}
+
+	// Signal to frontend that agent is fully ready
+	a.sendAudioControl("agent_ready")
+	log.Printf("[AGENT] Sent agent_ready signal to frontend")
 
 	return nil
 }
@@ -164,6 +178,33 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 			if len(pcmData) == 0 {
 				continue
 			}
+
+			// Check for end-of-audio marker (0xFF single byte)
+			if len(pcmData) == 1 && pcmData[0] == 0xFF {
+				a.mu.Lock()
+				a.isPlaying = false
+				a.mu.Unlock()
+				a.sendAudioControl("audio_end")
+				log.Printf("[AUDIO-CONTROL] Audio playback ended")
+				continue
+			}
+
+			// Check for interrupt before sending
+			a.mu.Lock()
+			if a.interruptPlayback {
+				a.mu.Unlock()
+				log.Printf("[BARGE-IN] Audio interrupted, skipping chunk")
+				continue
+			}
+
+			// Mark as playing and send audio_start if first chunk
+			if !a.isPlaying {
+				a.isPlaying = true
+				a.mu.Unlock()
+				a.sendAudioControl("audio_start")
+				a.mu.Lock()
+			}
+			a.mu.Unlock()
 
 			log.Printf("Sending TTS audio via data channel: %d bytes", len(pcmData))
 
@@ -192,7 +233,112 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 					log.Printf("Failed to send data packet: %v", err)
 				} else {
 					log.Printf("Sent audio data packet: %d bytes", len(jsonData))
+					// Track when we last sent audio for smart barge-in
+					a.mu.Lock()
+					a.lastAudioSentTime = time.Now()
+					a.mu.Unlock()
 				}
+			}
+		}
+	}
+}
+
+// sendAudioControl sends audio control messages (audio_start, audio_end, audio_stop)
+func (a *VoiceAgent) sendAudioControl(controlType string) {
+	msg := AudioMessage{
+		Type: controlType,
+	}
+
+	jsonData, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	if a.room != nil {
+		userData := lksdk.UserData(jsonData)
+		a.room.LocalParticipant.PublishDataPacket(
+			userData,
+			lksdk.WithDataPublishReliable(true),
+			lksdk.WithDataPublishTopic("audio"),
+		)
+		log.Printf("[AUDIO-CONTROL] Sent %s", controlType)
+	}
+}
+
+// triggerInterrupt sets the interrupt flag and clears pending audio (barge-in)
+func (a *VoiceAgent) triggerInterrupt() {
+	a.mu.Lock()
+	// Check if audio was recently sent (within 10s) - this is more reliable than isPlaying
+	// because backend finishes sending in ~1s but frontend plays for ~5-10s
+	sinceLastAudio := time.Since(a.lastAudioSentTime)
+	shouldInterrupt := a.isPlaying || sinceLastAudio < 10*time.Second
+
+	if shouldInterrupt {
+		a.interruptPlayback = true
+		a.isPlaying = false
+
+		// Clear transcript buffer so old text doesn't mix with new speech
+		a.transcriptBuf.Reset()
+
+		// Stop debounce timer to prevent processing stale transcript
+		if a.debounceTimer != nil {
+			a.debounceTimer.Stop()
+			a.debounceTimer = nil
+		}
+
+		a.mu.Unlock()
+
+		// Cancel any ongoing LLM request
+		a.mu.Lock()
+		if a.cancelRequest != nil {
+			a.cancelRequest()
+			log.Printf("[BARGE-IN] Cancelled LLM request")
+		}
+		a.mu.Unlock()
+
+		// Cancel the TTS generation
+		if a.ttsClient != nil {
+			a.ttsClient.Cancel()
+		}
+
+		// Drain the TTS audio channel
+		for {
+			select {
+			case <-a.ttsAudioChan:
+				// Discard pending audio
+			default:
+				goto done
+			}
+		}
+	done:
+		// Notify frontend to stop audio
+		a.sendAudioControl("audio_stop")
+		log.Printf("[BARGE-IN] Interrupt triggered, TTS cancelled, transcript cleared")
+
+		a.mu.Lock()
+		a.interruptPlayback = false
+		a.isProcessing = false // Allow new requests after barge-in
+		a.mu.Unlock()
+	} else {
+		a.mu.Unlock()
+	}
+}
+
+// listenForSpeechStart listens for Deepgram's SpeechStarted events
+// and triggers barge-in interrupt when user speaks during TTS playback
+func (a *VoiceAgent) listenForSpeechStart() {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-a.sttClient.SpeechStarted:
+			a.mu.Lock()
+			isPlaying := a.isPlaying
+			a.mu.Unlock()
+
+			if isPlaying {
+				log.Printf("[BARGE-IN] User started speaking while TTS playing, triggering interrupt")
+				a.triggerInterrupt()
 			}
 		}
 	}
@@ -200,43 +346,90 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 
 // processTranscripts handles incoming transcripts from Deepgram
 func (a *VoiceAgent) processTranscripts() {
-	const debounceDelay = 1000 * time.Millisecond
+	const debounceDelay = 300 * time.Millisecond // Reduced from 1000ms for faster response
 
 	processFn := func() {
+		processStart := time.Now()
+
 		a.mu.Lock()
+		// Prevent concurrent processing - only one LLM/TTS request at a time
+		if a.isProcessing {
+			a.mu.Unlock()
+			log.Printf("[BARGE-IN] Skipping processing, already in progress")
+			return
+		}
+		a.isProcessing = true
+
 		fullUtterance := strings.TrimSpace(a.transcriptBuf.String())
 		a.transcriptBuf.Reset()
 		a.mu.Unlock()
+
+		// Reset isProcessing when done
+		defer func() {
+			a.mu.Lock()
+			a.isProcessing = false
+			a.mu.Unlock()
+		}()
 
 		if fullUtterance == "" {
 			return
 		}
 
-		log.Printf("Processing utterance: %s", fullUtterance)
+		log.Printf("[LATENCY] STT → Agent: utterance received at %v", processStart.Format("15:04:05.000"))
+		log.Printf("[LATENCY] Processing utterance: %q", fullUtterance)
+
+		// Create cancellable context for this request - can be aborted on barge-in
+		requestCtx, cancel := context.WithCancel(a.ctx)
+		a.mu.Lock()
+		a.cancelRequest = cancel
+		a.mu.Unlock()
+		defer cancel() // Cleanup when done
 
 		// Get LLM response
-		responseStream, err := a.llmClient.GenerateResponse(a.ctx, fullUtterance)
+		llmStart := time.Now()
+		log.Printf("[LATENCY] LLM request started at %v (delta: +%vms from STT)",
+			llmStart.Format("15:04:05.000"), llmStart.Sub(processStart).Milliseconds())
+
+		responseStream, err := a.llmClient.GenerateResponse(requestCtx, fullUtterance)
 		if err != nil {
 			log.Printf("LLM Error: %v", err)
 			return
 		}
 
 		var fullResponse strings.Builder
+		firstChunk := true
+		var firstChunkTime time.Time
 		for text := range responseStream {
+			if firstChunk {
+				firstChunkTime = time.Now()
+				log.Printf("[LATENCY] LLM first chunk at %v (delta: +%vms from LLM start)",
+					firstChunkTime.Format("15:04:05.000"), firstChunkTime.Sub(llmStart).Milliseconds())
+				firstChunk = false
+			}
 			fullResponse.WriteString(text)
 		}
+		llmEnd := time.Now()
+		log.Printf("[LATENCY] LLM complete at %v (total LLM: %vms)",
+			llmEnd.Format("15:04:05.000"), llmEnd.Sub(llmStart).Milliseconds())
 
 		response := fullResponse.String()
 		if response != "" {
 			log.Printf("Agent response: %s", response)
 
-			// Send text response via data channel too
+			// Send text response via data channel
 			a.sendTextMessage(response)
 
-			// Send to TTS
+			// Send full response to TTS
 			if a.ttsClient != nil {
+				ttsStart := time.Now()
+				log.Printf("[LATENCY] TTS request started at %v (delta: +%vms from process start)",
+					ttsStart.Format("15:04:05.000"), ttsStart.Sub(processStart).Milliseconds())
+
 				if err := a.ttsClient.SendText(response); err != nil {
 					log.Printf("TTS Send Error: %v", err)
+				} else {
+					log.Printf("[LATENCY] TTS request sent at %v (total pipeline: %vms)",
+						time.Now().Format("15:04:05.000"), time.Since(processStart).Milliseconds())
 				}
 			}
 		}
@@ -255,6 +448,17 @@ func (a *VoiceAgent) processTranscripts() {
 	for transcript := range a.sttClient.Transcript {
 		if transcript == "" {
 			continue
+		}
+
+		// Only send audio_stop if we recently sent audio (within last 10s)
+		a.mu.Lock()
+		sinceLastAudio := time.Since(a.lastAudioSentTime)
+		a.mu.Unlock()
+
+		if sinceLastAudio < 10*time.Second {
+			log.Printf("[BARGE-IN] Transcript received, interrupting audio")
+			a.sendAudioControl("audio_stop")
+			a.triggerInterrupt()
 		}
 
 		a.mu.Lock()

@@ -53,6 +53,9 @@ setup:
 	@cd web/frontend && npm install
 	@echo "Setup complete!"
 
-# Run without hot reload
+# Run without hot reload (builds frontend first)
 run:
+	@echo "Building frontend..."
+	@cd web/frontend && npm run build
+	@echo "Starting server..."
 	@go run cmd/server/main.go

@@ -41,6 +41,7 @@ type VoiceAgent struct {
 	lastAudioSentTime time.Time // Track when audio was last sent for smart barge-in
 	isProcessing      bool      // Prevent concurrent LLM/TTS requests
 	cancelRequest     func()    // Cancel current LLM/TTS request on barge-in
+	lastInterruptTime time.Time // Track when barge-in occurred for cooldown
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -317,7 +318,8 @@ func (a *VoiceAgent) triggerInterrupt() {
 
 		a.mu.Lock()
 		a.interruptPlayback = false
-		a.isProcessing = false // Allow new requests after barge-in
+		a.isProcessing = false           // Allow new requests after barge-in
+		a.lastInterruptTime = time.Now() // Track when barge-in occurred
 		a.mu.Unlock()
 	} else {
 		a.mu.Unlock()
@@ -359,6 +361,16 @@ func (a *VoiceAgent) processTranscripts() {
 			return
 		}
 		a.isProcessing = true
+
+		// Check if we recently did a barge-in - wait for user to finish speaking
+		sinceInterrupt := time.Since(a.lastInterruptTime)
+		if sinceInterrupt < 1500*time.Millisecond && !a.lastInterruptTime.IsZero() {
+			waitTime := 1500*time.Millisecond - sinceInterrupt
+			a.mu.Unlock()
+			log.Printf("[BARGE-IN] Cooling down, waiting %vms for user to finish", waitTime.Milliseconds())
+			time.Sleep(waitTime)
+			a.mu.Lock()
+		}
 
 		fullUtterance := strings.TrimSpace(a.transcriptBuf.String())
 		a.transcriptBuf.Reset()

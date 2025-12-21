@@ -188,11 +188,13 @@ function VoiceUI() {
       analyser.getByteFrequencyData(dataArray);
       const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
 
-      // If user is speaking (level > 30) and we're playing audio, stop immediately
-      // Threshold 30 filters out background noise, adjust if needed
-      if (average > 50 && isPlayingRef.current) {
+      // If user is speaking (level > 20) and we're playing audio, stop immediately
+      // Threshold 30 filters out quiet background noise but catches speech quickly
+      if (average > 30 && isPlayingRef.current) {
         console.log(
-          "[LOCAL-VAD] User speaking detected, stopping audio instantly"
+          `[LOCAL-VAD] User speaking detected (level: ${average.toFixed(
+            2
+          )}), stopping audio instantly`
         );
         stopAllAudio();
       }

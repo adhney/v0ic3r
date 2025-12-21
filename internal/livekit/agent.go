@@ -318,7 +318,8 @@ func (a *VoiceAgent) triggerInterrupt() {
 
 		a.mu.Lock()
 		a.interruptPlayback = false
-		a.isProcessing = false           // Allow new requests after barge-in
+		// Don't manually reset isProcessing - let the cancelled request's defer handle it
+		// to prevent race conditions where new request starts before old one finishes cleanup
 		a.lastInterruptTime = time.Now() // Track when barge-in occurred
 		a.mu.Unlock()
 	} else {
@@ -348,7 +349,6 @@ func (a *VoiceAgent) listenForSpeechStart() {
 
 // processTranscripts handles incoming transcripts from Deepgram
 func (a *VoiceAgent) processTranscripts() {
-	const debounceDelay = 300 * time.Millisecond // Reduced from 1000ms for faster response
 
 	processFn := func() {
 		processStart := time.Now()
@@ -447,13 +447,25 @@ func (a *VoiceAgent) processTranscripts() {
 		}
 	}
 
+	const debounceDelay = 1200 * time.Millisecond
+
+	// Helper to trigger processing immediately
+	triggerProcessing := func() {
+		a.mu.Lock()
+		if a.debounceTimer != nil {
+			a.debounceTimer.Stop()
+			a.debounceTimer = nil
+		}
+		a.mu.Unlock()
+		// Execute processing
+		processFn()
+	}
+
 	// Listen for UtteranceEnd signals
 	go func() {
 		for range a.sttClient.UtteranceEnd {
-			if a.debounceTimer != nil {
-				a.debounceTimer.Stop()
-			}
-			a.debounceTimer = time.AfterFunc(100*time.Millisecond, processFn)
+			log.Printf("[LATENCY] STT UtteranceEnd detected at %v", time.Now().Format("15:04:05.000"))
+			triggerProcessing()
 		}
 	}()
 
@@ -478,14 +490,15 @@ func (a *VoiceAgent) processTranscripts() {
 			a.transcriptBuf.WriteString(" ")
 		}
 		a.transcriptBuf.WriteString(transcript)
-		a.mu.Unlock()
 
 		// Reset debounce timer
 		if a.debounceTimer != nil {
 			a.debounceTimer.Stop()
 		}
 		a.debounceTimer = time.AfterFunc(debounceDelay, processFn)
+		a.mu.Unlock()
 	}
+
 }
 
 // sendTextMessage sends text response via data channel

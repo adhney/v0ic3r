@@ -24,10 +24,59 @@ interface AudioMessage {
     | "audio_stop"
     | "audio_start"
     | "audio_end"
-    | "agent_ready";
+    | "agent_ready"
+    | "config";
   audio?: string; // base64
   sampleRate?: number;
   text?: string;
+  config?: { barge_in_enabled: boolean };
+  format?: string;
+}
+
+// Helper to add WAV header
+function addWavHeader(
+  samples: Uint8Array,
+  sampleRate: number = 44100
+): Uint8Array {
+  const buffer = new ArrayBuffer(44 + samples.length);
+  const view = new DataView(buffer);
+
+  // RIFF identifier
+  writeString(view, 0, "RIFF");
+  // file length
+  view.setUint32(4, 36 + samples.length, true);
+  // RIFF type
+  writeString(view, 8, "WAVE");
+  // format chunk identifier
+  writeString(view, 12, "fmt ");
+  // format chunk length
+  view.setUint32(16, 16, true);
+  // sample format (raw)
+  view.setUint16(20, 1, true);
+  // channel count
+  view.setUint16(22, 1, true);
+  // sample rate
+  view.setUint32(24, sampleRate, true);
+  // byte rate (sample rate * block align)
+  view.setUint32(28, sampleRate * 2, true);
+  // block align (channel count * bytes per sample)
+  view.setUint16(32, 2, true);
+  // bits per sample
+  view.setUint16(34, 16, true);
+  // data chunk identifier
+  writeString(view, 36, "data");
+  // data chunk length
+  view.setUint32(40, samples.length, true);
+
+  const bytes = new Uint8Array(buffer);
+  bytes.set(samples, 44);
+  return bytes;
+}
+
+function writeString(view: DataView, offset: number, string: string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
 }
 
 function VoiceUI() {
@@ -39,9 +88,13 @@ function VoiceUI() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [agentText, setAgentText] = useState<string>("");
   const [isAgentReady, setIsAgentReady] = useState(false);
+  const [bargeInEnabled, setBargeInEnabled] = useState(true);
 
   // Buffer for accumulating audio chunks (as binary)
   const audioBufferRef = useRef<Uint8Array[]>([]);
+  // Store format of current stream
+  const currentFormatRef = useRef<string>("mp3");
+
   const playbackQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
   const playbackTimeoutRef = useRef<number | null>(null);
@@ -55,6 +108,7 @@ function VoiceUI() {
     shouldIgnoreAudioRef.current = true;
     // Clear buffer
     audioBufferRef.current = [];
+    currentFormatRef.current = "mp3"; // Reset default
     // Clear playback queue and revoke URLs
     playbackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
     playbackQueueRef.current = [];
@@ -87,6 +141,13 @@ function VoiceUI() {
       if (data.type === "audio_start") {
         // New audio stream starting, accept audio again
         shouldIgnoreAudioRef.current = false;
+        currentFormatRef.current = data.format || "mp3"; // Capture format if provided
+        return;
+      }
+
+      if (data.type === "config" && data.config) {
+        console.log("[CONFIG] Barge-in enabled:", data.config.barge_in_enabled);
+        setBargeInEnabled(data.config.barge_in_enabled);
         return;
       }
 
@@ -109,6 +170,11 @@ function VoiceUI() {
         }
 
         console.log("Received audio chunk:", data.audio.length, "chars");
+
+        // Update format if provided in chunk
+        if (data.format) {
+          currentFormatRef.current = data.format;
+        }
 
         // Decode base64 to binary and buffer
         const binaryString = atob(data.audio);
@@ -139,8 +205,33 @@ function VoiceUI() {
 
             console.log("Buffered complete audio:", combined.length, "bytes");
 
+            // Detect format
+            let mimeType = "audio/mpeg";
+            let finalBuffer: any = combined;
+
+            // Check implicit format from stream or chunk
+            const format = currentFormatRef.current;
+
+            // Check for RIFF header (if provider sends WAV wrapped)
+            const hasRiff =
+              combined.length >= 4 &&
+              combined[0] === 0x52 &&
+              combined[1] === 0x49 &&
+              combined[2] === 0x46 &&
+              combined[3] === 0x46;
+
+            if (format === "pcm_s16le" && !hasRiff) {
+              // Wrap raw PCM in WAV header
+              console.log("Wrapping Raw PCM in WAV header");
+              finalBuffer = addWavHeader(combined as any, 44100);
+              mimeType = "audio/wav";
+            } else if (hasRiff) {
+              console.log("Detected existing WAV header");
+              mimeType = "audio/wav";
+            }
+
             // Create Blob and queue for playback
-            const blob = new Blob([combined], { type: "audio/mpeg" });
+            const blob = new Blob([finalBuffer], { type: mimeType });
             const url = URL.createObjectURL(blob);
             playbackQueueRef.current.push(url);
             audioBufferRef.current = [];
@@ -190,7 +281,7 @@ function VoiceUI() {
 
       // If user is speaking (level > 20) and we're playing audio, stop immediately
       // Threshold 30 filters out quiet background noise but catches speech quickly
-      if (average > 30 && isPlayingRef.current) {
+      if (bargeInEnabled && average > 30 && isPlayingRef.current) {
         console.log(
           `[LOCAL-VAD] User speaking detected (level: ${average.toFixed(
             2
@@ -208,7 +299,7 @@ function VoiceUI() {
       cancelAnimationFrame(animationId);
       audioContext.close();
     };
-  }, [isConnected, localTracks, stopAllAudio]);
+  }, [isConnected, localTracks, stopAllAudio, bargeInEnabled]);
 
   // Play combined audio using Audio element
   const playNextInQueue = () => {

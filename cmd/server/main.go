@@ -105,6 +105,9 @@ func startVoiceAgentInRoom(client *lk.Client, roomName string, cfg *config.Confi
 		DeepgramAPIKey:   cfg.DeepgramAPIKey,
 		GeminiAPIKey:     cfg.GeminiAPIKey,
 		ElevenLabsAPIKey: cfg.ElevenLabsAPIKey,
+		CartesiaAPIKey:   cfg.CartesiaAPIKey,
+		TTSProvider:      cfg.TTSProvider,
+		EnableBargeIn:    cfg.EnableBargeIn,
 	}
 
 	agent, err := lk.NewVoiceAgentWithConfig(client, roomName, agentCfg)

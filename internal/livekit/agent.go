@@ -25,7 +25,7 @@ type VoiceAgent struct {
 	// Service clients
 	sttClient *stt.DeepgramClient
 	llmClient *llm.GeminiClient
-	ttsClient *tts.ElevenLabsClient
+	ttsClient tts.TTSClient
 
 	// Audio channels
 	ttsAudioChan chan []byte
@@ -35,13 +35,15 @@ type VoiceAgent struct {
 	transcriptBuf strings.Builder
 	debounceTimer *time.Timer
 
-	// Interrupt handling (Vocalis-style barge-in)
+	// Interrupt handling
 	interruptPlayback bool      // Set when user speaks during TTS
 	isPlaying         bool      // True when TTS audio is being sent
 	lastAudioSentTime time.Time // Track when audio was last sent for smart barge-in
 	isProcessing      bool      // Prevent concurrent LLM/TTS requests
 	cancelRequest     func()    // Cancel current LLM/TTS request on barge-in
 	lastInterruptTime time.Time // Track when barge-in occurred for cooldown
+	enableBargeIn     bool      // Feature flag for interruptions
+	ttsProvider       string    // "elevenlabs" or "cartesia"
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -55,14 +57,19 @@ type AgentConfig struct {
 	DeepgramAPIKey   string
 	GeminiAPIKey     string
 	ElevenLabsAPIKey string
+	CartesiaAPIKey   string
+	TTSProvider      string // "elevenlabs" or "cartesia"
+	EnableBargeIn    bool
 }
 
 // AudioMessage sent via data channel
 type AudioMessage struct {
-	Type       string `json:"type"`
-	Audio      string `json:"audio"` // base64 encoded
-	SampleRate int    `json:"sampleRate"`
-	Text       string `json:"text,omitempty"` // for transcript display
+	Type       string                 `json:"type"`
+	Audio      string                 `json:"audio"` // base64 encoded
+	SampleRate int                    `json:"sampleRate"`
+	Text       string                 `json:"text,omitempty"`   // for transcript display
+	Config     map[string]interface{} `json:"config,omitempty"` // for feature flags
+	Format     string                 `json:"format,omitempty"` // "mp3" or "pcm_s16le"
 }
 
 // NewVoiceAgentWithConfig creates a new voice agent with full pipeline
@@ -80,18 +87,27 @@ func NewVoiceAgentWithConfig(client *Client, roomName string, cfg AgentConfig) (
 	}
 
 	// Initialize TTS client
-	ttsClient := tts.NewElevenLabsClient(cfg.ElevenLabsAPIKey)
+	var ttsClient tts.TTSClient
+	if cfg.TTSProvider == "cartesia" {
+		ttsClient = tts.NewCartesiaClient(cfg.CartesiaAPIKey)
+		log.Printf("[INIT] Using Cartesia TTS")
+	} else {
+		ttsClient = tts.NewElevenLabsClient(cfg.ElevenLabsAPIKey)
+		log.Printf("[INIT] Using ElevenLabs TTS")
+	}
 
 	return &VoiceAgent{
-		client:       client,
-		roomName:     roomName,
-		sttClient:    sttClient,
-		llmClient:    llmClient,
-		ttsClient:    ttsClient,
-		audioBuffer:  make(chan []byte, 100),
-		ttsAudioChan: make(chan []byte, 50),
-		ctx:          ctx,
-		cancelFunc:   cancel,
+		client:        client,
+		roomName:      roomName,
+		sttClient:     sttClient,
+		llmClient:     llmClient,
+		ttsClient:     ttsClient,
+		audioBuffer:   make(chan []byte, 100),
+		ttsAudioChan:  make(chan []byte, 50),
+		ctx:           ctx,
+		cancelFunc:    cancel,
+		enableBargeIn: cfg.EnableBargeIn,
+		ttsProvider:   cfg.TTSProvider,
 	}, nil
 }
 
@@ -154,17 +170,17 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 	}
 
 	if a.ttsClient != nil {
-		if err := a.ttsClient.Connect(a.ctx); err != nil {
-			log.Printf("Failed to connect TTS: %v", err)
-		}
-
-		// Start TTS audio receiver
-		go a.ttsClient.ReceiveAudio(a.ctx, a.ttsAudioChan)
+		// TTS client connection/warmup handled internally or lazy-loaded
 	}
 
+	// Send configuration to frontend
+	// Send configuration to frontend
+	a.sendAudioControl("config", map[string]interface{}{
+		"barge_in_enabled": a.enableBargeIn,
+	})
 	// Signal to frontend that agent is fully ready
-	a.sendAudioControl("agent_ready")
-	log.Printf("[AGENT] Sent agent_ready signal to frontend")
+	a.sendAudioControl("agent_ready", nil)
+	log.Printf("[AGENT] Sent agent_ready signal to frontend (BargeIn: %v)", a.enableBargeIn)
 
 	return nil
 }
@@ -175,7 +191,7 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 		select {
 		case <-a.ctx.Done():
 			return
-		case pcmData := <-a.ttsAudioChan:
+		case pcmData := <-a.ttsClient.AudioChannel():
 			if len(pcmData) == 0 {
 				continue
 			}
@@ -209,11 +225,18 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 
 			log.Printf("Sending TTS audio via data channel: %d bytes", len(pcmData))
 
+			// Determine format based on provider
+			format := "mp3"
+			if a.ttsProvider == "cartesia" {
+				format = "pcm_s16le"
+			}
+
 			// Encode audio as base64 and send via data channel
 			msg := AudioMessage{
 				Type:       "audio",
 				Audio:      base64.StdEncoding.EncodeToString(pcmData),
 				SampleRate: 44100, // Match ElevenLabs output
+				Format:     format,
 			}
 
 			jsonData, err := json.Marshal(msg)
@@ -245,9 +268,12 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 }
 
 // sendAudioControl sends audio control messages (audio_start, audio_end, audio_stop)
-func (a *VoiceAgent) sendAudioControl(controlType string) {
+func (a *VoiceAgent) sendAudioControl(controlType string, config ...map[string]interface{}) {
 	msg := AudioMessage{
 		Type: controlType,
+	}
+	if len(config) > 0 && config[0] != nil {
+		msg.Config = config[0]
 	}
 
 	jsonData, err := json.Marshal(msg)
@@ -268,6 +294,10 @@ func (a *VoiceAgent) sendAudioControl(controlType string) {
 
 // triggerInterrupt sets the interrupt flag and clears pending audio (barge-in)
 func (a *VoiceAgent) triggerInterrupt() {
+	if !a.enableBargeIn {
+		// Log sparingly or once
+		return
+	}
 	a.mu.Lock()
 	// Check if audio was recently sent (within 10s) - this is more reliable than isPlaying
 	// because backend finishes sending in ~1s but frontend plays for ~5-10s

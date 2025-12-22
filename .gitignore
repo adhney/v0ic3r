@@ -44,3 +44,5 @@ build/
 
 # Gemini/Claude artifacts (if any)
 .gemini/
+
+tmp/

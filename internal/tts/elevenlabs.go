@@ -47,6 +47,11 @@ func (e *ElevenLabsClient) SendText(text string) error {
 	return nil
 }
 
+// AudioChannel returns the channel where audio chunks are sent
+func (e *ElevenLabsClient) AudioChannel() <-chan []byte {
+	return e.audioChan
+}
+
 // Cancel interrupts the current TTS generation by closing the WebSocket
 func (e *ElevenLabsClient) Cancel() {
 	e.interrupted.Store(true)
@@ -56,6 +61,11 @@ func (e *ElevenLabsClient) Cancel() {
 		log.Printf("[TTS] Cancel: WebSocket closed")
 	}
 	e.connMu.Unlock()
+}
+
+// Close cleans up resources
+func (e *ElevenLabsClient) Close() {
+	e.Cancel()
 }
 
 func (e *ElevenLabsClient) speakAsync(text string) {
@@ -178,9 +188,4 @@ func (e *ElevenLabsClient) ReceiveAudio(ctx context.Context, audioChan chan<- []
 			audioChan <- chunk
 		}
 	}
-}
-
-func (e *ElevenLabsClient) Close() error {
-	close(e.audioChan)
-	return nil
 }

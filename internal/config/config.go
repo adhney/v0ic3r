@@ -12,6 +12,9 @@ type Config struct {
 	DeepgramAPIKey   string
 	GeminiAPIKey     string
 	ElevenLabsAPIKey string
+	CartesiaAPIKey   string
+	TTSProvider      string
+	EnableBargeIn    bool
 
 	// LiveKit
 	LiveKitURL       string
@@ -29,6 +32,9 @@ func LoadConfig() (*Config, error) {
 		DeepgramAPIKey:   getEnv("DEEPGRAM_API_KEY", ""),
 		GeminiAPIKey:     getEnv("GEMINI_API_KEY", ""),
 		ElevenLabsAPIKey: getEnv("ELEVENLABS_API_KEY", ""),
+		CartesiaAPIKey:   getEnv("CARTESIA_API_KEY", ""),
+		TTSProvider:      getEnv("TTS_PROVIDER", "elevenlabs"),
+		EnableBargeIn:    getEnv("ENABLE_BARGE_IN", "true") == "true",
 		LiveKitURL:       getEnv("LIVEKIT_URL", "ws://localhost:7880"),
 		LiveKitAPIKey:    getEnv("LIVEKIT_API_KEY", "devkey"),
 		LiveKitAPISecret: getEnv("LIVEKIT_API_SECRET", "secret"),

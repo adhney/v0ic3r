@@ -668,14 +668,14 @@ func (a *VoiceAgent) onDataPacket(data []byte, params lksdk.DataReceiveParams) {
 	if typeStr, ok := msg["type"].(string); ok && typeStr == "chat_input" {
 		if text, ok := msg["text"].(string); ok && text != "" {
 			log.Printf("Received chat input: %s", text)
-			go a.SimulateUserText(text)
+			go a.ProcessUserText(text)
 		}
 	}
 }
 
-// SimulateUserText processes text as if it was spoken by the user
-func (a *VoiceAgent) SimulateUserText(text string) {
-	log.Printf("[SIMULATION] Processing text: %q", text)
+// ProcessUserText processes text input (e.g. from browser STT)
+func (a *VoiceAgent) ProcessUserText(text string) {
+	log.Printf("[TEXT-INPUT] Processing text: %q", text)
 
 	// interrupt
 	a.triggerInterrupt()

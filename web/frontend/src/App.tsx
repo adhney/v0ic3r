@@ -4,7 +4,6 @@ import {
   RoomAudioRenderer,
   useConnectionState,
   useTracks,
-  useRemoteParticipants,
   useDataChannel,
   useLocalParticipant,
 } from "@livekit/components-react";
@@ -84,12 +83,10 @@ function writeString(view: DataView, offset: number, string: string) {
 function VoiceUI() {
   const connectionState = useConnectionState();
   const localTracks = useTracks([Track.Source.Microphone]);
-  const remoteParticipants = useRemoteParticipants();
   const { localParticipant } = useLocalParticipant();
   const isConnected = connectionState === ConnectionState.Connected;
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [agentText, setAgentText] = useState<string>("");
   const [isAgentReady, setIsAgentReady] = useState(false);
   const [bargeInEnabled, setBargeInEnabled] = useState(true);
   const [browserSTTEnabled, setBrowserSTTEnabled] = useState(false);
@@ -133,7 +130,7 @@ function VoiceUI() {
     setIsPlaying(false);
   }, []);
 
-  // Handle data channel messages on 'audio' topic
+  // Handle incoming data channel messages on 'audio' topic
   useDataChannel("audio", (msg) => {
     try {
       const data: AudioMessage = JSON.parse(
@@ -168,7 +165,6 @@ function VoiceUI() {
       }
 
       if (data.type === "text" && data.text) {
-        setAgentText(data.text);
         console.log("Agent text:", data.text);
       }
 
@@ -361,8 +357,8 @@ function VoiceUI() {
       const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
 
       // If user is speaking (level > 20) and we're playing audio, stop immediately
-      // Threshold 30 filters out quiet background noise but catches speech quickly
-      if (bargeInEnabled && average > 30 && isPlayingRef.current) {
+      // Threshold 50 filters out quiet background noise but catches speech quickly
+      if (bargeInEnabled && average > 50 && isPlayingRef.current) {
         console.log(
           `[LOCAL-VAD] User speaking detected (level: ${average.toFixed(
             2
@@ -425,18 +421,21 @@ function VoiceUI() {
   };
 
   return (
-    <div className="flex flex-col items-center justify-center gap-6">
-      {/* Connection Status */}
-      <div className="text-center text-sm">
-        <span className={isConnected ? "text-green-400" : "text-yellow-400"}>
-          {isConnected ? "● Connected" : "○ " + connectionState}
-        </span>
-        {remoteParticipants.length > 0 && (
-          <span className="ml-2 text-blue-400">
-            • Agent: {remoteParticipants[0]?.identity}
-          </span>
-        )}
+    <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">
+      {/* Header */}
+      <div className="text-center mb-8 space-y-2">
+        <h1 className="text-3xl font-semibold tracking-tight">
+          Voice Assistant
+        </h1>
+        <p className="text-zinc-400 text-sm">Powered by LiveKit</p>
       </div>
+
+      {/* Main Connection Check */}
+      {!isConnected && (
+        <div className="text-zinc-500 animate-pulse text-sm">
+          Connecting to server...
+        </div>
+      )}
 
       {/* Voice Visualizer Orb */}
       <div className="relative w-64 h-64 flex items-center justify-center -my-10">
@@ -444,33 +443,39 @@ function VoiceUI() {
       </div>
 
       {/* Status Text */}
-      <div className="text-center">
-        <p className="text-lg text-white/80">
-          {isPlaying
-            ? "Speaking..."
-            : isAgentReady
-            ? "Listening..."
-            : isConnected && remoteParticipants.length > 0
-            ? "Initializing..."
-            : isConnected
-            ? "Connecting to agent..."
-            : "Connecting..."}
-        </p>
+      <div className="mt-12 text-center h-8">
+        {isConnected && (
+          <div
+            className={`transition-all duration-300 ${
+              isPlaying ? "text-emerald-400" : "text-zinc-400"
+            }`}
+          >
+            {isPlaying ? (
+              <span className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                Speaking...
+              </span>
+            ) : (
+              <span
+                className={`text-sm ${
+                  isAgentReady ? "text-blue-400 animate-pulse" : "text-zinc-500"
+                }`}
+              >
+                {isAgentReady ? "Listening..." : "Connecting..."}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* Agent Response */}
-      {agentText && (
-        <div className="max-w-md p-4 bg-slate-800/50 rounded-lg">
-          <p className="text-sm text-white/70">{agentText}</p>
-        </div>
-      )}
-
-      {/* Debug Info */}
-      <div className="mt-4 p-3 bg-slate-800 rounded-lg max-w-md w-full">
-        <p className="text-xs text-white/60 font-mono">
-          🔊 Audio: {isPlaying ? "Playing" : "Idle"} | Buffer:{" "}
-          {audioBufferRef.current?.length || 0} | Tracks: {localTracks.length}
-        </p>
+      {/* End Call Button */}
+      <div className="mt-12">
+        <button
+          onClick={() => window.location.reload()} // Simple restart
+          className="px-6 py-2 rounded-full border border-red-900/30 text-red-400 hover:bg-red-950/30 hover:border-red-800 transition-all text-sm"
+        >
+          End Conversation
+        </button>
       </div>
     </div>
   );
@@ -509,35 +514,39 @@ function App() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 flex flex-col items-center justify-center p-8">
-      {/* Header */}
-      <div className="text-center mb-8">
-        <h1 className="text-3xl font-bold text-white mb-2">
-          Medicare Voice Assistant
-        </h1>
-        <p className="text-slate-400 text-sm">Powered by LiveKit</p>
-      </div>
+    <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">
+      {/* Show Connect Screen only if no token */}
+      {!tokenData && (
+        <>
+          <div className="text-center mb-8 space-y-2">
+            <h1 className="text-3xl font-semibold tracking-tight">
+              Voice Assistant
+            </h1>
+            <p className="text-zinc-400 text-sm">Powered by LiveKit</p>
+          </div>
 
-      {/* Main Content */}
-      {!tokenData && !isLoading && (
-        <div className="flex flex-col items-center gap-6">
-          <button
-            onClick={connect}
-            className="px-8 py-4 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold rounded-full shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 hover:scale-105 transition-all duration-300"
-          >
-            Start Conversation
-          </button>
-          {error && <p className="text-red-400 text-sm">{error}</p>}
-        </div>
+          {!isLoading && (
+            <div className="flex flex-col items-center gap-6">
+              <button
+                onClick={connect}
+                className="px-8 py-3 bg-zinc-100 text-zinc-950 font-medium rounded-full hover:bg-zinc-200 transition-all duration-300"
+              >
+                Start Conversation
+              </button>
+              {error && <p className="text-red-400 text-sm">{error}</p>}
+            </div>
+          )}
+
+          {isLoading && (
+            <div className="flex flex-col items-center gap-4">
+              <div className="w-8 h-8 border-2 border-zinc-500 border-t-zinc-200 rounded-full animate-spin" />
+              <p className="text-zinc-500 text-sm">Connecting...</p>
+            </div>
+          )}
+        </>
       )}
 
-      {isLoading && (
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
-          <p className="text-white/60">Getting room token...</p>
-        </div>
-      )}
-
+      {/* When Connected, LiveKitRoom takes over (VoiceUI handles the layout) */}
       {tokenData && (
         <LiveKitRoom
           serverUrl={tokenData.url}
@@ -546,17 +555,10 @@ function App() {
           audio={true}
           video={false}
           onDisconnected={disconnect}
-          className="flex flex-col items-center gap-6"
+          className="w-full h-full"
         >
           <VoiceUI />
           <RoomAudioRenderer />
-
-          <button
-            onClick={disconnect}
-            className="mt-4 px-6 py-2 border border-red-500/50 text-red-400 rounded-full hover:bg-red-500/10 transition-colors"
-          >
-            End Conversation
-          </button>
         </LiveKitRoom>
       )}
     </div>

@@ -43,6 +43,7 @@ type VoiceAgent struct {
 	cancelRequest     func()    // Cancel current LLM/TTS request on barge-in
 	lastInterruptTime time.Time // Track when barge-in occurred for cooldown
 	enableBargeIn     bool      // Feature flag for interruptions
+	enableBrowserSTT  bool      // Feature flag for browser-native STT
 	ttsProvider       string    // "elevenlabs" or "cartesia"
 
 	ctx        context.Context
@@ -60,6 +61,7 @@ type AgentConfig struct {
 	CartesiaAPIKey   string
 	TTSProvider      string // "elevenlabs" or "cartesia"
 	EnableBargeIn    bool
+	EnableBrowserSTT bool
 }
 
 // AudioMessage sent via data channel
@@ -97,17 +99,18 @@ func NewVoiceAgentWithConfig(client *Client, roomName string, cfg AgentConfig) (
 	}
 
 	return &VoiceAgent{
-		client:        client,
-		roomName:      roomName,
-		sttClient:     sttClient,
-		llmClient:     llmClient,
-		ttsClient:     ttsClient,
-		audioBuffer:   make(chan []byte, 100),
-		ttsAudioChan:  make(chan []byte, 50),
-		ctx:           ctx,
-		cancelFunc:    cancel,
-		enableBargeIn: cfg.EnableBargeIn,
-		ttsProvider:   cfg.TTSProvider,
+		client:           client,
+		roomName:         roomName,
+		sttClient:        sttClient,
+		llmClient:        llmClient,
+		ttsClient:        ttsClient,
+		audioBuffer:      make(chan []byte, 100),
+		ttsAudioChan:     make(chan []byte, 50),
+		ctx:              ctx,
+		cancelFunc:       cancel,
+		enableBargeIn:    cfg.EnableBargeIn,
+		enableBrowserSTT: cfg.EnableBrowserSTT,
+		ttsProvider:      cfg.TTSProvider,
 	}, nil
 }
 
@@ -136,6 +139,7 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 			OnTrackUnsubscribed: func(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 				log.Printf("Track unsubscribed from %s", rp.Identity())
 			},
+			OnDataReceived: a.onDataPacket,
 		},
 		OnParticipantConnected: func(rp *lksdk.RemoteParticipant) {
 			log.Printf("Participant connected: %s", rp.Identity())
@@ -157,7 +161,8 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 	go a.sendTTSAudioViaDataChannel()
 
 	// Start STT and TTS connections if initialized
-	if a.sttClient != nil {
+	// If Browser STT is enabled, we don't connect backend STT
+	if a.sttClient != nil && !a.enableBrowserSTT {
 		if err := a.sttClient.Connect(a.ctx); err != nil {
 			log.Printf("Failed to connect STT: %v", err)
 		}
@@ -176,7 +181,8 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 	// Send configuration to frontend
 	// Send configuration to frontend
 	a.sendAudioControl("config", map[string]interface{}{
-		"barge_in_enabled": a.enableBargeIn,
+		"barge_in_enabled":    a.enableBargeIn,
+		"browser_stt_enabled": a.enableBrowserSTT,
 	})
 	// Signal to frontend that agent is fully ready
 	a.sendAudioControl("agent_ready", nil)
@@ -647,4 +653,103 @@ func (a *VoiceAgent) Stop() {
 	}
 
 	log.Printf("Voice agent stopped")
+}
+
+// onDataPacket handles incoming data from the frontend
+func (a *VoiceAgent) onDataPacket(data []byte, params lksdk.DataReceiveParams) {
+	// Handle data packet
+	// Ensure it's text
+	var msg map[string]interface{}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		// likely not JSON or not for us
+		return
+	}
+
+	if typeStr, ok := msg["type"].(string); ok && typeStr == "chat_input" {
+		if text, ok := msg["text"].(string); ok && text != "" {
+			log.Printf("Received chat input: %s", text)
+			go a.SimulateUserText(text)
+		}
+	}
+}
+
+// SimulateUserText processes text as if it was spoken by the user
+func (a *VoiceAgent) SimulateUserText(text string) {
+	log.Printf("[SIMULATION] Processing text: %q", text)
+
+	// interrupt
+	a.triggerInterrupt()
+
+	// Process response
+	go a.processProcessingFlow(text)
+}
+
+// processProcessingFlow encapsulates the logic from processTranscripts
+// to be reusable for chat input
+func (a *VoiceAgent) processProcessingFlow(text string) {
+	// Mark processing start
+	a.mu.Lock()
+	if a.isProcessing {
+		a.mu.Unlock()
+		return
+	}
+	a.isProcessing = true
+	// Cancel any ongoing request context
+	if a.cancelRequest != nil {
+		a.cancelRequest()
+	}
+	// Create new cancellable request context
+	reqCtx, cancel := context.WithCancel(a.ctx)
+	a.cancelRequest = cancel
+	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		a.isProcessing = false
+		if a.cancelRequest != nil {
+			a.cancelRequest() // Clean up context
+			a.cancelRequest = nil
+		}
+		a.mu.Unlock()
+	}()
+
+	start := time.Now()
+	log.Printf("[LATENCY] Processing utterance: %q", text)
+
+	var completeResponse strings.Builder
+
+	// 1. Generate Response (Gemini)
+	llmStart := time.Now()
+	log.Printf("[LATENCY] LLM request started at %s", llmStart.Format("15:04:05.000"))
+
+	respChan, err := a.llmClient.GenerateResponse(reqCtx, text)
+	if err != nil {
+		log.Printf("LLM Error: %v", err)
+		return
+	}
+	log.Printf("[LATENCY] LLM stream started at %s", time.Now().Format("15:04:05.000"))
+
+	// 2. Accumulate and Send to TTS
+	// We accumulate full text for now to match current simple logic
+	for chunk := range respChan {
+		completeResponse.WriteString(chunk)
+	}
+
+	fullText := completeResponse.String()
+	log.Printf("Agent response: %s", fullText)
+
+	// Send to TTS
+	if fullText != "" {
+		ttsStart := time.Now()
+		log.Printf("[LATENCY] TTS request started at %s", ttsStart.Format("15:04:05.000"))
+		a.ttsClient.SendText(fullText)
+	}
+
+	// Send text to frontend for display
+	a.sendAudioControl("text", map[string]interface{}{
+		"text": fullText,
+	})
+
+	duration := time.Since(start)
+	log.Printf("Processing complete in %v", duration)
 }

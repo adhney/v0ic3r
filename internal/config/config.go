@@ -16,10 +16,10 @@ type Config struct {
 	TTSProvider      string
 	EnableBargeIn    bool
 
-	// LiveKit
 	LiveKitURL       string
 	LiveKitAPIKey    string
 	LiveKitAPISecret string
+	EnableBrowserSTT bool
 }
 
 func LoadConfig() (*Config, error) {
@@ -35,6 +35,7 @@ func LoadConfig() (*Config, error) {
 		CartesiaAPIKey:   getEnv("CARTESIA_API_KEY", ""),
 		TTSProvider:      getEnv("TTS_PROVIDER", "elevenlabs"),
 		EnableBargeIn:    getEnv("ENABLE_BARGE_IN", "true") == "true",
+		EnableBrowserSTT: getEnv("ENABLE_BROWSER_STT", "false") == "true",
 		LiveKitURL:       getEnv("LIVEKIT_URL", "ws://localhost:7880"),
 		LiveKitAPIKey:    getEnv("LIVEKIT_API_KEY", "devkey"),
 		LiveKitAPISecret: getEnv("LIVEKIT_API_SECRET", "secret"),

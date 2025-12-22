@@ -6,10 +6,12 @@ import {
   useTracks,
   useRemoteParticipants,
   useDataChannel,
+  useLocalParticipant,
 } from "@livekit/components-react";
 import { ConnectionState, Track } from "livekit-client";
 import "@livekit/components-styles";
 import "./index.css";
+import AgentOrb from "./components/AgentOrb";
 
 interface TokenData {
   token: string;
@@ -29,7 +31,7 @@ interface AudioMessage {
   audio?: string; // base64
   sampleRate?: number;
   text?: string;
-  config?: { barge_in_enabled: boolean };
+  config?: { barge_in_enabled: boolean; browser_stt_enabled?: boolean };
   format?: string;
 }
 
@@ -83,17 +85,22 @@ function VoiceUI() {
   const connectionState = useConnectionState();
   const localTracks = useTracks([Track.Source.Microphone]);
   const remoteParticipants = useRemoteParticipants();
+  const { localParticipant } = useLocalParticipant();
   const isConnected = connectionState === ConnectionState.Connected;
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [agentText, setAgentText] = useState<string>("");
   const [isAgentReady, setIsAgentReady] = useState(false);
   const [bargeInEnabled, setBargeInEnabled] = useState(true);
+  const [browserSTTEnabled, setBrowserSTTEnabled] = useState(false);
 
   // Buffer for accumulating audio chunks (as binary)
   const audioBufferRef = useRef<Uint8Array[]>([]);
   // Store format of current stream
   const currentFormatRef = useRef<string>("mp3");
+  // Web Speech API Ref
+  const recognitionRef = useRef<any>(null);
+  const isRecognitionRunningRef = useRef(false);
 
   const playbackQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
@@ -146,8 +153,11 @@ function VoiceUI() {
       }
 
       if (data.type === "config" && data.config) {
-        console.log("[CONFIG] Barge-in enabled:", data.config.barge_in_enabled);
-        setBargeInEnabled(data.config.barge_in_enabled);
+        console.log("[CONFIG] Received:", data.config);
+        if (data.config.barge_in_enabled !== undefined)
+          setBargeInEnabled(data.config.barge_in_enabled);
+        if (data.config.browser_stt_enabled !== undefined)
+          setBrowserSTTEnabled(data.config.browser_stt_enabled);
         return;
       }
 
@@ -253,8 +263,79 @@ function VoiceUI() {
       if (playbackTimeoutRef.current) {
         clearTimeout(playbackTimeoutRef.current);
       }
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
     };
   }, []);
+
+  // Browser Native STT Logic
+  useEffect(() => {
+    if (
+      browserSTTEnabled &&
+      isConnected &&
+      "webkitSpeechRecognition" in window
+    ) {
+      console.log("[BROWSER-STT] Initializing Speech Recognition");
+      // @ts-ignore
+      const recognition = new window.webkitSpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      recognition.lang = "en-US";
+
+      recognition.onstart = () => {
+        console.log("[BROWSER-STT] Started listening");
+        isRecognitionRunningRef.current = true;
+      };
+
+      recognition.onerror = (event: any) => {
+        console.error("[BROWSER-STT] Error:", event.error);
+      };
+
+      recognition.onend = () => {
+        console.log("[BROWSER-STT] Ended");
+        isRecognitionRunningRef.current = false;
+        // Auto-restart if still enabled
+        if (browserSTTEnabled && isConnected) {
+          console.log("[BROWSER-STT] Restarting...");
+          try {
+            recognition.start();
+          } catch (e) {}
+        }
+      };
+
+      recognition.onresult = (event: any) => {
+        const transcript =
+          event.results[event.results.length - 1][0].transcript;
+        console.log("[BROWSER-STT] Recognized:", transcript);
+
+        if (transcript.trim().length > 0) {
+          // Send to backend via Data Channel
+          const msg = JSON.stringify({ type: "chat_input", text: transcript });
+          const encoder = new TextEncoder();
+          const payload = encoder.encode(msg);
+
+          if (localParticipant) {
+            localParticipant.publishData(payload, { reliable: true });
+          }
+        }
+      };
+
+      recognitionRef.current = recognition;
+      try {
+        recognition.start();
+      } catch (e) {
+        console.error(e);
+      }
+
+      return () => {
+        if (recognitionRef.current) {
+          recognitionRef.current.stop();
+          recognitionRef.current = null;
+        }
+      };
+    }
+  }, [browserSTTEnabled, isConnected, localParticipant]);
 
   // Local VAD (Voice Activity Detection) for instant barge-in
   // Monitors microphone level and stops audio when user speaks - no STT delay
@@ -358,24 +439,8 @@ function VoiceUI() {
       </div>
 
       {/* Voice Visualizer Orb */}
-      <div className="relative w-40 h-40 flex items-center justify-center">
-        <div
-          className={`absolute inset-0 rounded-full transition-all duration-500 ${
-            isPlaying
-              ? "bg-gradient-to-br from-green-500 to-emerald-500 shadow-2xl shadow-green-500/40 animate-pulse"
-              : isConnected
-              ? "bg-gradient-to-br from-blue-500 to-cyan-500 shadow-2xl shadow-blue-500/40"
-              : "bg-gradient-to-br from-slate-600 to-slate-700"
-          }`}
-        />
-        <div className="relative z-10">
-          <div className="w-10 h-10 text-white/80">
-            <svg viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-              <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-            </svg>
-          </div>
-        </div>
+      <div className="relative w-64 h-64 flex items-center justify-center -my-10">
+        <AgentOrb isPlaying={isPlaying} isConnected={isConnected} />
       </div>
 
       {/* Status Text */}

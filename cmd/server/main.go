@@ -108,6 +108,7 @@ func startVoiceAgentInRoom(client *lk.Client, roomName string, cfg *config.Confi
 		CartesiaAPIKey:   cfg.CartesiaAPIKey,
 		TTSProvider:      cfg.TTSProvider,
 		EnableBargeIn:    cfg.EnableBargeIn,
+		EnableBrowserSTT: cfg.EnableBrowserSTT,
 	}
 
 	agent, err := lk.NewVoiceAgentWithConfig(client, roomName, agentCfg)

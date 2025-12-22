@@ -5,7 +5,6 @@ import {
   MeshDistortMaterial,
   Environment,
   Float,
-  Stars,
 } from "@react-three/drei";
 import * as THREE from "three";
 
@@ -106,15 +105,7 @@ export default function AgentOrb(props: AgentOrbProps) {
         <GlowingSphere {...props} />
 
         <Environment preset="city" />
-        <Stars
-          radius={100}
-          depth={50}
-          count={1000}
-          factor={4}
-          saturation={0}
-          fade
-          speed={1}
-        />
+        {/* Removed Stars component */}
       </Canvas>
     </div>
   );

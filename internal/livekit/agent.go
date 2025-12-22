@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -17,8 +18,9 @@ import (
 )
 
 type ttsJob struct {
-	text string
-	ctx  context.Context
+	text         string
+	ctx          context.Context
+	generationID uint64 // Unique ID for each response generation
 }
 
 // VoiceAgent handles the voice interaction pipeline within a LiveKit room
@@ -51,6 +53,8 @@ type VoiceAgent struct {
 	enableBargeIn     bool      // Feature flag for interruptions
 	enableBrowserSTT  bool      // Feature flag for browser-native STT
 	ttsProvider       string    // "elevenlabs" or "cartesia"
+	currentGenID      uint64    // Current generation ID - incremented on each interrupt
+	lastProcessTime   time.Time // Track when we last started processing to de-duplicate
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -363,6 +367,16 @@ func (a *VoiceAgent) triggerInterrupt() {
 			case <-a.ttsAudioChan:
 				// Discard pending audio
 			default:
+				goto drainQueue
+			}
+		}
+	drainQueue:
+		// Drain the TTS sentence queue so pending sentences aren't spoken
+		for {
+			select {
+			case job := <-a.ttsQueue:
+				log.Printf("[BARGE-IN] Discarded queued sentence: %q", job.text)
+			default:
 				goto done
 			}
 		}
@@ -373,6 +387,9 @@ func (a *VoiceAgent) triggerInterrupt() {
 
 		a.mu.Lock()
 		a.interruptPlayback = false
+		// Increment generation ID to invalidate any remaining TTS jobs from old generation
+		a.currentGenID++
+		log.Printf("[BARGE-IN] Incremented generation ID to %d", a.currentGenID)
 		// Don't manually reset isProcessing - let the cancelled request's defer handle it
 		// to prevent race conditions where new request starts before old one finishes cleanup
 		a.lastInterruptTime = time.Now() // Track when barge-in occurred
@@ -394,9 +411,14 @@ func (a *VoiceAgent) listenForSpeechStart() {
 			isPlaying := a.isPlaying
 			a.mu.Unlock()
 
+			log.Printf("[BARGE-IN-DEBUG] SpeechStarted event received. isPlaying=%v", isPlaying)
+
 			if isPlaying {
-				log.Printf("[BARGE-IN] User started speaking while TTS playing, triggering interrupt")
-				a.triggerInterrupt()
+				// log.Printf("[BARGE-IN] User started speaking while TTS playing, triggering interrupt")
+				// a.triggerInterrupt()
+				log.Printf("[BARGE-IN-DEBUG] SpeechStarted detected but backend interrupt DISABLED (relying on frontend VAD)")
+			} else {
+				log.Printf("[BARGE-IN-DEBUG] Ignored SpeechStarted because isPlaying=false")
 			}
 		}
 	}
@@ -409,13 +431,23 @@ func (a *VoiceAgent) processTranscripts() {
 		processStart := time.Now()
 
 		a.mu.Lock()
-		// Prevent concurrent processing - only one LLM/TTS request at a time
+		// De-duplication: Skip if we processed very recently (within 500ms)
+		// This handles duplicate UtteranceEnd events from Deepgram
+		if time.Since(a.lastProcessTime) < 500*time.Millisecond {
+			a.mu.Unlock()
+			log.Printf("[DEDUP] Skipping duplicate processing request (last: %vms ago)",
+				time.Since(a.lastProcessTime).Milliseconds())
+			return
+		}
+
+		// If already processing, skip (don't interrupt - let it complete)
 		if a.isProcessing {
 			a.mu.Unlock()
-			log.Printf("[BARGE-IN] Skipping processing, already in progress")
+			log.Printf("[DEDUP] Skipping processing, already in progress")
 			return
 		}
 		a.isProcessing = true
+		a.lastProcessTime = processStart
 
 		// Check if we recently did a barge-in - wait for user to finish speaking
 		sinceInterrupt := time.Since(a.lastInterruptTime)
@@ -429,6 +461,8 @@ func (a *VoiceAgent) processTranscripts() {
 
 		fullUtterance := strings.TrimSpace(a.transcriptBuf.String())
 		a.transcriptBuf.Reset()
+		// Capture current generation ID for this request
+		genID := a.currentGenID
 		a.mu.Unlock()
 
 		// Reset isProcessing when done
@@ -452,7 +486,7 @@ func (a *VoiceAgent) processTranscripts() {
 		a.mu.Unlock()
 		defer cancel() // Cleanup when done
 
-		// Get LLM response
+		// Get LLM response and stream sentences to TTS immediately (low-latency)
 		llmStart := time.Now()
 		log.Printf("[LATENCY] LLM request started at %v (delta: +%vms from STT)",
 			llmStart.Format("15:04:05.000"), llmStart.Sub(processStart).Milliseconds())
@@ -463,46 +497,104 @@ func (a *VoiceAgent) processTranscripts() {
 			return
 		}
 
-		var fullResponse strings.Builder
+		// Stream sentences to TTS as they complete - don't wait for full response
+		var completeResponse strings.Builder
+		var buffer strings.Builder
 		firstChunk := true
-		var firstChunkTime time.Time
-		for text := range responseStream {
+
+		for chunk := range responseStream {
+			// Check for context cancellation (barge-in) at the start of each chunk
+			if requestCtx.Err() != nil {
+				log.Printf("[BARGE-IN] LLM streaming cancelled, stopping loop")
+				break
+			}
+
+			// Check if generation ID changed (barge-in occurred)
+			a.mu.Lock()
+			currentGen := a.currentGenID
+			a.mu.Unlock()
+			if genID < currentGen {
+				log.Printf("[BARGE-IN] Generation changed (%d -> %d), stopping LLM streaming", genID, currentGen)
+				break
+			}
+
 			if firstChunk {
-				firstChunkTime = time.Now()
 				log.Printf("[LATENCY] LLM first chunk at %v (delta: +%vms from LLM start)",
-					firstChunkTime.Format("15:04:05.000"), firstChunkTime.Sub(llmStart).Milliseconds())
+					time.Now().Format("15:04:05.000"), time.Since(llmStart).Milliseconds())
 				firstChunk = false
 			}
-			fullResponse.WriteString(text)
+
+			buffer.WriteString(chunk)
+			completeResponse.WriteString(chunk)
+
+			// Sentence boundary detection - send to TTS as soon as sentence ends
+			current := buffer.String()
+			runes := []rune(current)
+			length := len(runes)
+			processedPos := 0
+
+			for i := 0; i < length; i++ {
+				r := runes[i]
+				isEnd := false
+
+				if r == '.' || r == '!' || r == '?' {
+					if i+1 >= length {
+						// End of buffer - wait for next chunk
+					} else if runes[i+1] == ' ' || runes[i+1] == '\n' || runes[i+1] == '\t' {
+						isEnd = true
+					}
+				}
+
+				if isEnd {
+					sentence := strings.TrimSpace(string(runes[processedPos : i+1]))
+					if sentence != "" {
+						// Use a.ctx instead of requestCtx so jobs aren't cancelled when processFn returns
+						a.ttsQueue <- ttsJob{
+							text:         sentence,
+							ctx:          a.ctx,
+							generationID: genID,
+						}
+						log.Printf("[TTS-STREAM] Queued sentence (gen %d): %q", genID, sentence)
+					}
+					processedPos = i + 1
+				}
+			}
+
+			// Keep remainder in buffer
+			if processedPos > 0 {
+				if processedPos < length {
+					buffer.Reset()
+					buffer.WriteString(string(runes[processedPos:]))
+				} else {
+					buffer.Reset()
+				}
+			}
 		}
+
+		// Flush remaining text
+		remaining := strings.TrimSpace(buffer.String())
+		if remaining != "" {
+			a.ttsQueue <- ttsJob{
+				text:         remaining,
+				ctx:          a.ctx,
+				generationID: genID,
+			}
+			log.Printf("[TTS-STREAM] Queued remaining (gen %d): %q", genID, remaining)
+		}
+
 		llmEnd := time.Now()
 		log.Printf("[LATENCY] LLM complete at %v (total LLM: %vms)",
 			llmEnd.Format("15:04:05.000"), llmEnd.Sub(llmStart).Milliseconds())
 
-		response := fullResponse.String()
+		response := completeResponse.String()
 		if response != "" {
 			log.Printf("Agent response: %s", response)
-
 			// Send text response via data channel
 			a.sendTextMessage(response)
-
-			// Send full response to TTS
-			if a.ttsClient != nil {
-				ttsStart := time.Now()
-				log.Printf("[LATENCY] TTS request started at %v (delta: +%vms from process start)",
-					ttsStart.Format("15:04:05.000"), ttsStart.Sub(processStart).Milliseconds())
-
-				if err := a.ttsClient.SendText(response); err != nil {
-					log.Printf("TTS Send Error: %v", err)
-				} else {
-					log.Printf("[LATENCY] TTS request sent at %v (total pipeline: %vms)",
-						time.Now().Format("15:04:05.000"), time.Since(processStart).Milliseconds())
-				}
-			}
 		}
 	}
 
-	const debounceDelay = 1200 * time.Millisecond
+	const debounceDelay = 500 * time.Millisecond
 
 	// Helper to trigger processing immediately
 	triggerProcessing := func() {
@@ -516,10 +608,10 @@ func (a *VoiceAgent) processTranscripts() {
 		processFn()
 	}
 
-	// Listen for UtteranceEnd signals
+	// Listen for UtteranceEnd signals (now with faster 500ms config)
 	go func() {
 		for range a.sttClient.UtteranceEnd {
-			log.Printf("[LATENCY] STT UtteranceEnd detected at %v", time.Now().Format("15:04:05.000"))
+			log.Printf("[STT] UtteranceEnd detected, triggering processing")
 			triggerProcessing()
 		}
 	}()
@@ -593,8 +685,9 @@ func (a *VoiceAgent) onTrackSubscribed(track *webrtc.TrackRemote, publication *l
 
 // processAudioTrack reads audio data from a track and sends to STT
 func (a *VoiceAgent) processAudioTrack(track *webrtc.TrackRemote, rp *lksdk.RemoteParticipant) {
-	log.Printf("Processing audio track from: %s (codec: %s)",
-		rp.Identity(), track.Codec().MimeType)
+	codecType := track.Codec().MimeType
+	log.Printf("Processing audio track from: %s (codec: %s, PayloadType: %d)",
+		rp.Identity(), codecType, track.Codec().PayloadType)
 
 	packetCount := 0
 	bytesSent := 0
@@ -619,11 +712,37 @@ func (a *VoiceAgent) processAudioTrack(track *webrtc.TrackRemote, rp *lksdk.Remo
 		// The RTP payload is Opus audio (possibly wrapped in RED)
 		payload := rtpPacket.Payload
 
-		// Check if this is RED encoded
-		if len(payload) > 1 && track.Codec().MimeType == "audio/red" {
-			if len(payload) > 4 {
-				payload = payload[4:]
+		// Check if this is RED encoded - need to properly extract primary Opus data
+		if codecType == "audio/red" {
+			// RED header: F(1) + blockPT(7) for primary codec
+			// If F=0, it's the primary (last) block header (1 byte)
+			// We need to skip all redundant blocks and get to primary
+			if len(payload) > 0 {
+				// Find the primary block (first byte with F=0)
+				offset := 0
+				for offset < len(payload) {
+					if payload[offset]&0x80 == 0 {
+						// F=0, this is the primary block header
+						offset++ // Skip the 1-byte header
+						break
+					}
+					// F=1, this is a redundant block header (4 bytes)
+					offset += 4
+				}
+				if offset < len(payload) {
+					payload = payload[offset:]
+				}
 			}
+		}
+
+		// Log first packet and every 500th with hex prefix for debugging
+		if packetCount == 1 || packetCount%500 == 0 {
+			hexPrefix := ""
+			if len(payload) >= 4 {
+				hexPrefix = fmt.Sprintf("0x%02x%02x%02x%02x", payload[0], payload[1], payload[2], payload[3])
+			}
+			log.Printf("[AUDIO-DEBUG] Packet #%d: codec=%s, size=%d bytes, prefix=%s",
+				packetCount, codecType, len(payload), hexPrefix)
 		}
 
 		// Log every 100 packets
@@ -631,7 +750,23 @@ func (a *VoiceAgent) processAudioTrack(track *webrtc.TrackRemote, rp *lksdk.Remo
 			log.Printf("Audio packet #%d, size: %d bytes", packetCount, len(payload))
 		}
 
-		// Send to STT
+		// Skip DTX (Discontinuous Transmission) packets - these are silence indicators
+		// Opus DTX packets are typically 1-3 bytes and contain no useful audio
+		if len(payload) < 3 {
+			// Very small packet - likely DTX silence frame, skip
+			continue
+		}
+
+		// Check for Opus comfort noise / DTX frames
+		// Opus TOC byte: first 2 bits are config, if config is certain values it's CELT-only silence
+		// Skip packets that are likely comfort noise (very small with specific patterns)
+		// A normal Opus speech packet is typically 20-200+ bytes
+		if len(payload) < 10 {
+			// Very short packet - likely just a silence descriptor
+			continue
+		}
+
+		// Send to STT - only real audio content now
 		if a.sttClient != nil && len(payload) > 0 {
 			if err := a.sttClient.SendAudio(payload); err != nil {
 				log.Printf("STT Send Error: %v", err)
@@ -692,9 +827,10 @@ func (a *VoiceAgent) onDataPacket(data []byte, params lksdk.DataReceiveParams) {
 				go a.ProcessUserText(text)
 			}
 		case "interrupt":
-			log.Printf("[BARGE-IN] Received interrupt signal from frontend")
+			log.Printf("=== [BARGE-IN] Received interrupt signal from frontend ===")
 			a.sendAudioControl("audio_stop") // Acknowledge with stop
 			a.triggerInterrupt()
+			log.Printf("=== [BARGE-IN] Interrupt processing complete ===")
 		}
 	}
 }
@@ -727,6 +863,8 @@ func (a *VoiceAgent) processProcessingFlow(text string) {
 	// Create new cancellable request context
 	reqCtx, cancel := context.WithCancel(a.ctx)
 	a.cancelRequest = cancel
+	// Capture current generation ID for this request
+	genID := a.currentGenID
 	a.mu.Unlock()
 
 	defer func() {
@@ -760,6 +898,21 @@ func (a *VoiceAgent) processProcessingFlow(text string) {
 	firstChunk := true
 
 	for chunk := range respChan {
+		// Check for context cancellation (barge-in) at the start of each chunk
+		if reqCtx.Err() != nil {
+			log.Printf("[BARGE-IN] LLM streaming cancelled in processProcessingFlow")
+			break
+		}
+
+		// Check if generation ID changed (barge-in occurred)
+		a.mu.Lock()
+		currentGen := a.currentGenID
+		a.mu.Unlock()
+		if genID < currentGen {
+			log.Printf("[BARGE-IN] Generation changed (%d -> %d), stopping LLM streaming", genID, currentGen)
+			break
+		}
+
 		if firstChunk {
 			log.Printf("[LATENCY] LLM first token: %s", time.Now().Format("15:04:05.000"))
 			firstChunk = false
@@ -812,8 +965,9 @@ func (a *VoiceAgent) processProcessingFlow(text string) {
 				sentence := string(runes[processedPos : i+1])
 				// Push to worker
 				a.ttsQueue <- ttsJob{
-					text: strings.TrimSpace(sentence),
-					ctx:  reqCtx,
+					text:         strings.TrimSpace(sentence),
+					ctx:          reqCtx,
+					generationID: genID,
 				}
 
 				// Advance
@@ -836,8 +990,9 @@ func (a *VoiceAgent) processProcessingFlow(text string) {
 	remaining := strings.TrimSpace(buffer.String())
 	if remaining != "" {
 		a.ttsQueue <- ttsJob{
-			text: remaining,
-			ctx:  reqCtx,
+			text:         remaining,
+			ctx:          reqCtx,
+			generationID: genID,
 		}
 	}
 
@@ -858,6 +1013,17 @@ func (a *VoiceAgent) processProcessingFlow(text string) {
 func (a *VoiceAgent) runTTSWorker() {
 	log.Println("TTS Worker started")
 	for job := range a.ttsQueue {
+		// Check generation ID - skip jobs from interrupted generations
+		a.mu.Lock()
+		currentGen := a.currentGenID
+		a.mu.Unlock()
+
+		if job.generationID < currentGen {
+			log.Printf("[TTS-WORKER] Skipping job from old generation %d (current: %d): %q",
+				job.generationID, currentGen, job.text)
+			continue
+		}
+
 		// Check context before processing (handle interruption)
 		if job.ctx.Err() != nil {
 			log.Printf("[TTS-WORKER] Skipping job due to context cancellation: %q", job.text)
@@ -871,7 +1037,7 @@ func (a *VoiceAgent) runTTSWorker() {
 
 		if a.ttsClient != nil {
 			start := time.Now()
-			log.Printf("[TTS-WORKER] Processing sentence: %q", job.text)
+			log.Printf("[TTS-WORKER] Processing sentence (gen %d): %q", job.generationID, job.text)
 
 			// This call is now SYNCHRONOUS/BLOCKING
 			err := a.ttsClient.SendText(job.text)
@@ -887,20 +1053,8 @@ func (a *VoiceAgent) runTTSWorker() {
 // runAudioSender consumes existing ttsAudioChan and sends to LiveKit
 func (a *VoiceAgent) runAudioSender() {
 	log.Println("Audio Sender started")
-	var isPlaying bool
-	// Reset isPlaying when we haven't received audio for a while?
-	// Or we expect the TTS worker to tell us?
 
-	// For now, let's just assume if we receive data and we weren't just playing, we start.
-	// However, ttsQueue handles the flow.
-
-	// Actually, simpler: The TTSWorker pushes to ttsAudioChan.
-	// The previous grep showed 'sendAudioControl' existing.
-	// Let's rely on the CLIENT-SIDE to handle 'audio_start' or FORCE it here.
-
-	// We'll trust the worker or logic upstream?
-	// Wait, the grep output showed `a.sendAudioControl("audio_start")` appearing in the file.
-	// Let's just Add it here to be safe if it's missing in the flow.
+	// We use the struct's isPlaying state with locking
 
 	for {
 		select {
@@ -908,9 +1062,31 @@ func (a *VoiceAgent) runAudioSender() {
 			if !ok {
 				return
 			}
+
+			// Check for end-of-audio marker (0xFF single byte)
+			if len(audioData) == 1 && audioData[0] == 0xFF {
+				a.mu.Lock()
+				isPlaying := a.isPlaying
+				a.isPlaying = false
+				a.mu.Unlock()
+
+				if isPlaying {
+					a.sendAudioControl("audio_end")
+					log.Printf("[AUDIO-CONTROL] Audio playback ended (marker)")
+				}
+				continue
+			}
+
+			a.mu.Lock()
+			isPlaying := a.isPlaying
+			a.mu.Unlock()
+
 			if !isPlaying {
 				a.sendAudioControl("audio_start")
-				isPlaying = true
+				a.mu.Lock()
+				a.isPlaying = true
+				a.mu.Unlock()
+				log.Printf("[AUDIO-CONTROL] Audio playback started")
 			}
 
 			// Forward to frontend via Data Channel
@@ -931,10 +1107,18 @@ func (a *VoiceAgent) runAudioSender() {
 				}
 			}
 
-		case <-time.After(500 * time.Millisecond):
-			// If no audio for 500ms, assume utterance ended
+		case <-time.After(2000 * time.Millisecond):
+			// If no audio for 2s, assume utterance ended
+			// Increased from 500ms to prevent flickering during TTS generation pauses
+			a.mu.Lock()
+			isPlaying := a.isPlaying
 			if isPlaying {
-				isPlaying = false
+				a.isPlaying = false
+				a.mu.Unlock()
+				a.sendAudioControl("audio_end")
+				log.Printf("[AUDIO-CONTROL] Audio playback ended (timeout)")
+			} else {
+				a.mu.Unlock()
 			}
 		}
 	}

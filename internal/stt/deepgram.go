@@ -40,7 +40,8 @@ func (d *DeepgramClient) Connect(ctx context.Context) error {
 		SampleRate:     48000,  // WebRTC default for Opus
 		Channels:       1,
 		InterimResults: true,
-		UtteranceEndMs: "1000", // Deepgram fires UtteranceEnd after 1s of silence
+		VadEvents:      true,   // Enable VAD events (SpeechStarted)
+		UtteranceEndMs: "1000", // Fire UtteranceEnd after 500ms silence
 	}
 
 	callback := &DeepgramReceiver{d: d}
@@ -85,12 +86,20 @@ func (r *DeepgramReceiver) Open(or *msginterfaces.OpenResponse) error {
 }
 
 func (r *DeepgramReceiver) Message(mr *msginterfaces.MessageResponse) error {
+	// Debug: Log all messages from Deepgram
+	log.Printf("[STT-DEBUG] Message received: Type=%s, IsFinal=%v, SpeechFinal=%v",
+		mr.Type, mr.IsFinal, mr.SpeechFinal)
+
 	if len(mr.Channel.Alternatives) > 0 {
 		alt := mr.Channel.Alternatives[0]
-		if len(alt.Transcript) > 0 && mr.IsFinal {
-			log.Printf("[LATENCY] STT transcript received at %v: %q",
-				time.Now().Format("15:04:05.000"), alt.Transcript)
-			r.d.Transcript <- alt.Transcript
+		log.Printf("[STT-DEBUG] Transcript: %q (IsFinal: %v)", alt.Transcript, mr.IsFinal)
+
+		if len(alt.Transcript) > 0 {
+			if mr.IsFinal {
+				// Final transcript - send for actual processing
+				log.Printf("[STT] Final transcript: %q", alt.Transcript)
+				r.d.Transcript <- alt.Transcript
+			}
 		}
 	}
 	return nil

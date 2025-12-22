@@ -233,13 +233,13 @@ function VoiceUI() {
         currentAudioRef.current.load();
       }
 
-      // Safety: If no new audio starts within 3 seconds, assume false alarm or network issue and un-ignore
+      // Safety: If no new audio starts within 10 seconds, assume false alarm or network issue and un-ignore
       if (bargeInResetTimerRef.current)
         clearTimeout(bargeInResetTimerRef.current);
       bargeInResetTimerRef.current = window.setTimeout(() => {
         console.log("[BARGE-IN] Safety reset: un-ignoring audio");
         shouldIgnoreAudioRef.current = false;
-      }, 3000);
+      }, 10000);
 
       // Send interrupt signal to backend ONLY if triggered locally
       if (fromBargeIn && localParticipant) {
@@ -432,12 +432,17 @@ function VoiceUI() {
 
       if (data.type === "audio_start") {
         // New audio stream starting, accept audio again
+        console.log("[AUDIO] audio_start received, starting playback");
         shouldIgnoreAudioRef.current = false;
         if (bargeInResetTimerRef.current)
           clearTimeout(bargeInResetTimerRef.current);
 
         const format = data.format || "mp3";
         currentFormatRef.current = format;
+
+        // Set playing state immediately
+        isPlayingRef.current = true;
+        setIsPlaying(true);
 
         // Pick strategy
         if (format === "mp3") {
@@ -700,7 +705,7 @@ function VoiceUI() {
               2
             )}), stopping audio`
           );
-          stopAllAudio();
+          stopAllAudio(true); // Pass true to send interrupt to backend
           speakingFrames = 0; // Reset
         }
       }

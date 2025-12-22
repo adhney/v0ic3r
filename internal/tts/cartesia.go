@@ -54,9 +54,10 @@ func (c *CartesiaClient) Cancel() {
 }
 
 // SendText implements the TTSClient interface
+// Updated to be synchronous for sequential streaming
 func (c *CartesiaClient) SendText(text string) error {
 	c.interrupted.Store(false)
-	go c.speakAsync(text)
+	c.speakAsync(text)
 	return nil
 }
 

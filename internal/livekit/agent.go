@@ -16,6 +16,11 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+type ttsJob struct {
+	text string
+	ctx  context.Context
+}
+
 // VoiceAgent handles the voice interaction pipeline within a LiveKit room
 type VoiceAgent struct {
 	client   *Client
@@ -29,6 +34,7 @@ type VoiceAgent struct {
 
 	// Audio channels
 	ttsAudioChan chan []byte
+	ttsQueue     chan ttsJob
 
 	// Audio processing
 	audioBuffer   chan []byte
@@ -106,6 +112,7 @@ func NewVoiceAgentWithConfig(client *Client, roomName string, cfg AgentConfig) (
 		ttsClient:        ttsClient,
 		audioBuffer:      make(chan []byte, 100),
 		ttsAudioChan:     make(chan []byte, 50),
+		ttsQueue:         make(chan ttsJob, 50),
 		ctx:              ctx,
 		cancelFunc:       cancel,
 		enableBargeIn:    cfg.EnableBargeIn,
@@ -158,7 +165,19 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 	log.Printf("Voice agent started in room: %s", a.roomName)
 
 	// Start TTS audio sender via data channel
-	go a.sendTTSAudioViaDataChannel()
+	go a.runAudioSender()
+
+	// Start TTS worker
+	go a.runTTSWorker()
+
+	// Bridge TTS client audio to agent's audio sender
+	if a.ttsClient != nil {
+		go func() {
+			for chunk := range a.ttsClient.AudioChannel() {
+				a.ttsAudioChan <- chunk
+			}
+		}()
+	}
 
 	// Start STT and TTS connections if initialized
 	// If Browser STT is enabled, we don't connect backend STT
@@ -665,10 +684,17 @@ func (a *VoiceAgent) onDataPacket(data []byte, params lksdk.DataReceiveParams) {
 		return
 	}
 
-	if typeStr, ok := msg["type"].(string); ok && typeStr == "chat_input" {
-		if text, ok := msg["text"].(string); ok && text != "" {
-			log.Printf("Received chat input: %s", text)
-			go a.ProcessUserText(text)
+	if typeStr, ok := msg["type"].(string); ok {
+		switch typeStr {
+		case "chat_input":
+			if text, ok := msg["text"].(string); ok && text != "" {
+				log.Printf("Received chat input: %s", text)
+				go a.ProcessUserText(text)
+			}
+		case "interrupt":
+			log.Printf("[BARGE-IN] Received interrupt signal from frontend")
+			a.sendAudioControl("audio_stop") // Acknowledge with stop
+			a.triggerInterrupt()
 		}
 	}
 }
@@ -729,27 +755,187 @@ func (a *VoiceAgent) processProcessingFlow(text string) {
 	}
 	log.Printf("[LATENCY] LLM stream started at %s", time.Now().Format("15:04:05.000"))
 
-	// 2. Accumulate and Send to TTS
-	// We accumulate full text for now to match current simple logic
+	// 2. Stream Sentences to TTS Worker
+	var buffer strings.Builder
+	firstChunk := true
+
 	for chunk := range respChan {
+		if firstChunk {
+			log.Printf("[LATENCY] LLM first token: %s", time.Now().Format("15:04:05.000"))
+			firstChunk = false
+		}
+
+		buffer.WriteString(chunk)
 		completeResponse.WriteString(chunk)
+
+		// Simple sentence boundary detection
+		// Check for punctuation followed by space or newline
+		// Optimized: only check if chunk contained punctuation to avoid scanning huge buffer constantly
+		// But buffer grows, so we scan from recent position?
+		// For simplicity, just check the whole buffer (sentences are short)
+
+		current := buffer.String()
+		// Split logic: look for [.!?] followed by space/end?
+		// We'll iterate to separate multiple sentences if they came in one chunk
+
+		// Regex is heavy, manual scan:
+		processedPos := 0
+		runes := []rune(current)
+		length := len(runes)
+
+		for i := 0; i < length; i++ {
+			r := runes[i]
+			isEnd := false
+
+			// Check delimiters
+			if r == '.' || r == '!' || r == '?' {
+				// Check next char (needs to be space, newline, or End of String)
+				if i+1 >= length {
+					// End of current buffer - this MIGHT be end of sentence,
+					// but wait for next chunk to confirm it's not "Dr." or "3.14"?
+					// Actually, for streaming speed, let's assume end-of-buffer punctuation IS a boundary
+					// if we are aggressive. But "Dr." at end of chunk is common.
+					// Safer: wait for space or assume if we have decent length.
+					// Let's implement aggressive: Punctuation + Space OR specific endings.
+					// We can just wait for space.
+					// If i+1 >= length, we continue and keep in buffer? Yes.
+				} else {
+					next := runes[i+1]
+					if next == ' ' || next == '\n' || next == '\t' {
+						isEnd = true
+					}
+				}
+			}
+
+			if isEnd {
+				// Found a sentence boundary at 'i'
+				sentence := string(runes[processedPos : i+1])
+				// Push to worker
+				a.ttsQueue <- ttsJob{
+					text: strings.TrimSpace(sentence),
+					ctx:  reqCtx,
+				}
+
+				// Advance
+				processedPos = i + 1
+			}
+		}
+
+		// Keep the remainder in buffer
+		if processedPos > 0 {
+			if processedPos < length {
+				buffer.Reset()
+				buffer.WriteString(string(runes[processedPos:]))
+			} else {
+				buffer.Reset()
+			}
+		}
+	}
+
+	// 3. Flush remaining text
+	remaining := strings.TrimSpace(buffer.String())
+	if remaining != "" {
+		a.ttsQueue <- ttsJob{
+			text: remaining,
+			ctx:  reqCtx,
+		}
 	}
 
 	fullText := completeResponse.String()
-	log.Printf("Agent response: %s", fullText)
+	log.Printf("Agent response (full): %s", fullText)
 
-	// Send to TTS
-	if fullText != "" {
-		ttsStart := time.Now()
-		log.Printf("[LATENCY] TTS request started at %s", ttsStart.Format("15:04:05.000"))
-		a.ttsClient.SendText(fullText)
-	}
-
-	// Send text to frontend for display
+	// Send text to frontend for display (Full update)
+	// Optionally sending partial updates would be cool but full is fine for now
 	a.sendAudioControl("text", map[string]interface{}{
 		"text": fullText,
 	})
 
 	duration := time.Since(start)
 	log.Printf("Processing complete in %v", duration)
+}
+
+// runTTSWorker consumes sentences and sends them to TTS client sequentially
+func (a *VoiceAgent) runTTSWorker() {
+	log.Println("TTS Worker started")
+	for job := range a.ttsQueue {
+		// Check context before processing (handle interruption)
+		if job.ctx.Err() != nil {
+			log.Printf("[TTS-WORKER] Skipping job due to context cancellation: %q", job.text)
+			continue
+		}
+
+		// Skip empty
+		if job.text == "" {
+			continue
+		}
+
+		if a.ttsClient != nil {
+			start := time.Now()
+			log.Printf("[TTS-WORKER] Processing sentence: %q", job.text)
+
+			// This call is now SYNCHRONOUS/BLOCKING
+			err := a.ttsClient.SendText(job.text)
+			if err != nil {
+				log.Printf("[TTS-WORKER] Error: %v", err)
+			}
+
+			log.Printf("[TTS-WORKER] Sentence complete in %vms", time.Since(start).Milliseconds())
+		}
+	}
+}
+
+// runAudioSender consumes existing ttsAudioChan and sends to LiveKit
+func (a *VoiceAgent) runAudioSender() {
+	log.Println("Audio Sender started")
+	var isPlaying bool
+	// Reset isPlaying when we haven't received audio for a while?
+	// Or we expect the TTS worker to tell us?
+
+	// For now, let's just assume if we receive data and we weren't just playing, we start.
+	// However, ttsQueue handles the flow.
+
+	// Actually, simpler: The TTSWorker pushes to ttsAudioChan.
+	// The previous grep showed 'sendAudioControl' existing.
+	// Let's rely on the CLIENT-SIDE to handle 'audio_start' or FORCE it here.
+
+	// We'll trust the worker or logic upstream?
+	// Wait, the grep output showed `a.sendAudioControl("audio_start")` appearing in the file.
+	// Let's just Add it here to be safe if it's missing in the flow.
+
+	for {
+		select {
+		case audioData, ok := <-a.ttsAudioChan:
+			if !ok {
+				return
+			}
+			if !isPlaying {
+				a.sendAudioControl("audio_start")
+				isPlaying = true
+			}
+
+			// Forward to frontend via Data Channel
+			msg := AudioMessage{
+				Type:  "audio",
+				Audio: base64.StdEncoding.EncodeToString(audioData),
+			}
+
+			jsonData, err := json.Marshal(msg)
+			if err == nil {
+				if a.room != nil {
+					userData := lksdk.UserData(jsonData)
+					a.room.LocalParticipant.PublishDataPacket(
+						userData,
+						lksdk.WithDataPublishReliable(true),
+						lksdk.WithDataPublishTopic("audio"),
+					)
+				}
+			}
+
+		case <-time.After(500 * time.Millisecond):
+			// If no audio for 500ms, assume utterance ended
+			if isPlaying {
+				isPlaying = false
+			}
+		}
+	}
 }

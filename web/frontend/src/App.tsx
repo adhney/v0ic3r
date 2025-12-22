@@ -80,6 +80,9 @@ function writeString(view: DataView, offset: number, string: string) {
   }
 }
 
+// Module-level deduplication for Strict Mode compatibility
+let lastGlobalMessagePayload = "";
+
 function VoiceUI() {
   const connectionState = useConnectionState();
   const localTracks = useTracks([Track.Source.Microphone]);
@@ -91,173 +94,171 @@ function VoiceUI() {
   const [bargeInEnabled, setBargeInEnabled] = useState(true);
   const [browserSTTEnabled, setBrowserSTTEnabled] = useState(false);
 
-  // Buffer for accumulating audio chunks (as binary)
-  const audioBufferRef = useRef<Uint8Array[]>([]);
   // Store format of current stream
   const currentFormatRef = useRef<string>("mp3");
   // Web Speech API Ref
   const recognitionRef = useRef<any>(null);
   const isRecognitionRunningRef = useRef(false);
 
-  const playbackQueueRef = useRef<string[]>([]);
+  // Web Audio API Refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
   const isPlayingRef = useRef(false);
-  const playbackTimeoutRef = useRef<number | null>(null);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const shouldIgnoreAudioRef = useRef(false); // Set after barge-in to ignore incoming chunks
+  const shouldIgnoreAudioRef = useRef(false);
 
-  // Stop all audio playback (for barge-in)
-  const stopAllAudio = useCallback(() => {
-    console.log("[BARGE-IN] Stopping all audio");
-    // Ignore any incoming audio until next audio_start
-    shouldIgnoreAudioRef.current = true;
-    // Clear buffer
-    audioBufferRef.current = [];
-    currentFormatRef.current = "mp3"; // Reset default
-    // Clear playback queue and revoke URLs
-    playbackQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
-    playbackQueueRef.current = [];
-    // Clear pending timeout
-    if (playbackTimeoutRef.current) {
-      clearTimeout(playbackTimeoutRef.current);
-      playbackTimeoutRef.current = null;
+  // MSE Refs for MP3
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const mseQueueRef = useRef<Uint8Array[]>([]);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const playbackTimeoutRef = useRef<number | null>(null);
+  const bargeInResetTimerRef = useRef<number | null>(null); // Safety timer
+
+  // Initialize AudioContext
+  const initAudioContext = useCallback(() => {
+    if (
+      !audioContextRef.current ||
+      audioContextRef.current.state === "closed"
+    ) {
+      audioContextRef.current = new (window.AudioContext ||
+        (window as any).webkitAudioContext)();
+      nextStartTimeRef.current = audioContextRef.current.currentTime;
     }
-    // Stop current audio
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
+    if (audioContextRef.current.state === "suspended") {
+      audioContextRef.current.resume();
     }
-    isPlayingRef.current = false;
-    setIsPlaying(false);
+    return audioContextRef.current;
   }, []);
 
-  // Handle incoming data channel messages on 'audio' topic
-  useDataChannel("audio", (msg) => {
-    try {
-      const data: AudioMessage = JSON.parse(
-        new TextDecoder().decode(msg.payload)
-      );
+  // Initialize MSE
+  const initMSE = useCallback(() => {
+    if (mediaSourceRef.current && mediaSourceRef.current.readyState === "open")
+      return;
 
-      if (data.type === "audio_stop") {
-        stopAllAudio();
-        return;
-      }
+    console.log("[MSE] Initializing MediaSource for MP3");
+    const ms = new MediaSource();
+    mediaSourceRef.current = ms;
 
-      if (data.type === "audio_start") {
-        // New audio stream starting, accept audio again
-        shouldIgnoreAudioRef.current = false;
-        currentFormatRef.current = data.format || "mp3"; // Capture format if provided
-        return;
-      }
-
-      if (data.type === "config" && data.config) {
-        console.log("[CONFIG] Received:", data.config);
-        if (data.config.barge_in_enabled !== undefined)
-          setBargeInEnabled(data.config.barge_in_enabled);
-        if (data.config.browser_stt_enabled !== undefined)
-          setBrowserSTTEnabled(data.config.browser_stt_enabled);
-        return;
-      }
-
-      if (data.type === "agent_ready") {
-        console.log("[AGENT] Agent is ready");
-        setIsAgentReady(true);
-        return;
-      }
-
-      if (data.type === "text" && data.text) {
-        console.log("Agent text:", data.text);
-      }
-
-      if (data.type === "audio" && data.audio) {
-        // Ignore audio if we're in barge-in stop mode
-        if (shouldIgnoreAudioRef.current) {
-          console.log("[BARGE-IN] Ignoring audio chunk (stopped)");
-          return;
-        }
-
-        console.log("Received audio chunk:", data.audio.length, "chars");
-
-        // Update format if provided in chunk
-        if (data.format) {
-          currentFormatRef.current = data.format;
-        }
-
-        // Decode base64 to binary and buffer
-        const binaryString = atob(data.audio);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        audioBufferRef.current.push(bytes);
-
-        // Reset the timeout - we'll play after 300ms of no new chunks
-        if (playbackTimeoutRef.current) {
-          clearTimeout(playbackTimeoutRef.current);
-        }
-
-        playbackTimeoutRef.current = window.setTimeout(() => {
-          // Combine all buffered binary chunks
-          if (audioBufferRef.current.length > 0) {
-            const totalLength = audioBufferRef.current.reduce(
-              (acc, arr) => acc + arr.length,
-              0
-            );
-            const combined = new Uint8Array(totalLength);
-            let offset = 0;
-            for (const chunk of audioBufferRef.current) {
-              combined.set(chunk, offset);
-              offset += chunk.length;
-            }
-
-            console.log("Buffered complete audio:", combined.length, "bytes");
-
-            // Detect format
-            let mimeType = "audio/mpeg";
-            let finalBuffer: any = combined;
-
-            // Check implicit format from stream or chunk
-            const format = currentFormatRef.current;
-
-            // Check for RIFF header (if provider sends WAV wrapped)
-            const hasRiff =
-              combined.length >= 4 &&
-              combined[0] === 0x52 &&
-              combined[1] === 0x49 &&
-              combined[2] === 0x46 &&
-              combined[3] === 0x46;
-
-            if (format === "pcm_s16le" && !hasRiff) {
-              // Wrap raw PCM in WAV header
-              console.log("Wrapping Raw PCM in WAV header");
-              finalBuffer = addWavHeader(combined as any, 44100);
-              mimeType = "audio/wav";
-            } else if (hasRiff) {
-              console.log("Detected existing WAV header");
-              mimeType = "audio/wav";
-            }
-
-            // Create Blob and queue for playback
-            const blob = new Blob([finalBuffer], { type: mimeType });
-            const url = URL.createObjectURL(blob);
-            playbackQueueRef.current.push(url);
-            audioBufferRef.current = [];
-
-            if (!isPlayingRef.current) {
-              playNextInQueue();
-            }
-          }
-        }, 300);
-      }
-    } catch (e) {
-      console.error("Failed to parse data channel message:", e);
+    // Create audio element for MSE
+    if (!currentAudioRef.current) {
+      const audio = new Audio();
+      currentAudioRef.current = audio;
+      audio.src = URL.createObjectURL(ms);
+      audio.play().catch((e) => console.error("MSE Play error:", e));
+    } else {
+      currentAudioRef.current.src = URL.createObjectURL(ms);
+      currentAudioRef.current
+        .play()
+        .catch((e) => console.error("MSE Play error:", e));
     }
-  });
+
+    const onSourceOpen = () => {
+      console.log("[MSE] SourceOpen");
+      if (currentAudioRef.current)
+        URL.revokeObjectURL(currentAudioRef.current.src);
+      try {
+        if (MediaSource.isTypeSupported("audio/mpeg")) {
+          if (sourceBufferRef.current) return;
+          const sb = ms.addSourceBuffer("audio/mpeg");
+          sourceBufferRef.current = sb;
+          sb.addEventListener("updateend", () => processMSEQueue());
+          setTimeout(processMSEQueue, 0);
+        } else {
+          console.error("[MSE] audio/mpeg not supported");
+        }
+      } catch (e) {
+        console.error("[MSE] Failed to add SourceBuffer:", e);
+      }
+    };
+
+    ms.addEventListener("sourceopen", onSourceOpen, { once: true });
+  }, []);
+
+  const processMSEQueue = useCallback(() => {
+    if (!sourceBufferRef.current || sourceBufferRef.current.updating) return;
+
+    if (mseQueueRef.current.length > 0) {
+      const chunk = mseQueueRef.current.shift()!;
+      try {
+        sourceBufferRef.current.appendBuffer(chunk as any);
+      } catch (e) {
+        console.error("[MSE] Append error:", e);
+      }
+    }
+  }, []);
+
+  // Stop all audio playback (for barge-in)
+  const stopAllAudio = useCallback(
+    (fromBargeIn: boolean = false) => {
+      // IDEMPOTENCY GUARD: If already ignoring audio, do nothing.
+      // This prevents VAD spam from triggering multiple stops/interrupts.
+      // Exception: If it's a remote stop command, we might want to ensure cleanup?
+      // But for now, sticking to strict idempotency.
+      if (shouldIgnoreAudioRef.current) {
+        return;
+      }
+
+      console.log(
+        `[BARGE-IN] Stopping all audio (source: ${
+          fromBargeIn ? "local-vad" : "remote"
+        })`
+      );
+      // Ignore any incoming audio until next audio_start
+      shouldIgnoreAudioRef.current = true;
+
+      // Stop AudioContext if active
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(console.error);
+        audioContextRef.current = null;
+      }
+      nextStartTimeRef.current = 0;
+
+      // Stop MSE if active
+      mseQueueRef.current = [];
+      if (sourceBufferRef.current) {
+        try {
+          if (mediaSourceRef.current?.readyState === "open") {
+            sourceBufferRef.current.abort();
+          }
+        } catch (e) {}
+      }
+      // Cleanup MSE refs entirely to force re-init
+      sourceBufferRef.current = null;
+      mediaSourceRef.current = null;
+
+      // Re-create audio element to clear buffer
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current.removeAttribute("src");
+        currentAudioRef.current.load();
+      }
+
+      // Safety: If no new audio starts within 3 seconds, assume false alarm or network issue and un-ignore
+      if (bargeInResetTimerRef.current)
+        clearTimeout(bargeInResetTimerRef.current);
+      bargeInResetTimerRef.current = window.setTimeout(() => {
+        console.log("[BARGE-IN] Safety reset: un-ignoring audio");
+        shouldIgnoreAudioRef.current = false;
+      }, 3000);
+
+      // Send interrupt signal to backend ONLY if triggered locally
+      if (fromBargeIn && localParticipant) {
+        const msg = JSON.stringify({ type: "interrupt" });
+        const encoder = new TextEncoder();
+        localParticipant.publishData(encoder.encode(msg), { reliable: true });
+      }
+
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+    },
+    [processMSEQueue, localParticipant]
+  );
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (playbackTimeoutRef.current) {
-        clearTimeout(playbackTimeoutRef.current);
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
       }
       if (recognitionRef.current) {
         recognitionRef.current.stop();
@@ -334,7 +335,6 @@ function VoiceUI() {
   }, [browserSTTEnabled, isConnected, localParticipant]);
 
   // Local VAD (Voice Activity Detection) for instant barge-in
-  // Monitors microphone level and stops audio when user speaks - no STT delay
   useEffect(() => {
     if (!isConnected || localTracks.length === 0) return;
 
@@ -351,20 +351,358 @@ function VoiceUI() {
 
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     let animationId: number;
+    let speakingFrames = 0;
 
     const checkAudioLevel = () => {
       analyser.getByteFrequencyData(dataArray);
       const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
 
-      // If user is speaking (level > 20) and we're playing audio, stop immediately
-      // Threshold 50 filters out quiet background noise but catches speech quickly
-      if (bargeInEnabled && average > 50 && isPlayingRef.current) {
-        console.log(
-          `[LOCAL-VAD] User speaking detected (level: ${average.toFixed(
-            2
-          )}), stopping audio instantly`
-        );
-        stopAllAudio();
+      // Threshold 45 is sensitive, but we require sustained speech (e.g. 5 frames ~ 80ms)
+      const isActuallyPlaying =
+        isPlayingRef.current ||
+        (currentAudioRef.current && !currentAudioRef.current.paused);
+
+      // IMPORTANT: Don't re-trigger if we are already ignoring audio (barge-in active)
+      if (
+        bargeInEnabled &&
+        isActuallyPlaying &&
+        !shouldIgnoreAudioRef.current
+      ) {
+        // Debug log every ~100 frames (approx 1.5s) to check mic levels
+        if (speakingFrames === 0 && Math.random() < 0.01) {
+          console.log(`[LOCAL-VAD] Current mic level: ${average.toFixed(2)}`);
+        }
+
+        if (average > 45) {
+          speakingFrames++;
+        } else {
+          speakingFrames = 0;
+        }
+
+        if (speakingFrames > 5) {
+          console.log(
+            `[LOCAL-VAD] Sustained speech detected (level: ${average.toFixed(
+              2
+            )}), stopping audio`
+          );
+          stopAllAudio(true);
+          speakingFrames = 0; // Reset
+        }
+      }
+
+      animationId = requestAnimationFrame(checkAudioLevel);
+    };
+
+    checkAudioLevel();
+
+    return () => {
+      cancelAnimationFrame(animationId);
+      source.disconnect();
+      analyser.disconnect();
+      audioContext.close().catch(() => {});
+    };
+  }, [isConnected, localTracks, stopAllAudio, bargeInEnabled]);
+
+  // Handle incoming data channel messages on 'audio' topic
+  useDataChannel("audio", (msg) => {
+    try {
+      const payloadString = new TextDecoder().decode(msg.payload);
+
+      // DEDUPLICATION: Check if this is exactly the same message as last time
+      // (Simple check to prevent double-firing in Strict Mode or rapid duplicate sends)
+      if (lastGlobalMessagePayload === payloadString) {
+        return;
+      }
+      lastGlobalMessagePayload = payloadString;
+
+      const data: AudioMessage = JSON.parse(payloadString);
+
+      // --- FILTERING LOGIC ---
+      // If we interrupted recently, discard any "old" text or audio that might have been in flight.
+      // We use a simple memory: if shouldIgnoreAudioRef is true, we ignore.
+      // But we also need to ignore *stale* messages that arrive just after we un-ignore.
+      // For now, strict "ignore if ignoring" + the backend cancellation should suffice.
+      // The user issue "answering the old thing" implies backend sent it.
+      // If backend sends it, it means backend didn't cancel fast enough or we have a race.
+
+      if (data.type === "audio_stop") {
+        stopAllAudio(false); // Remote stop
+        return;
+      }
+
+      if (data.type === "audio_start") {
+        // New audio stream starting, accept audio again
+        shouldIgnoreAudioRef.current = false;
+        if (bargeInResetTimerRef.current)
+          clearTimeout(bargeInResetTimerRef.current);
+
+        const format = data.format || "mp3";
+        currentFormatRef.current = format;
+
+        // Pick strategy
+        if (format === "mp3") {
+          initMSE();
+        } else {
+          initAudioContext();
+        }
+        return;
+      }
+
+      if (data.type === "config" && data.config) {
+        console.log("[CONFIG] Received:", data.config);
+        if (data.config.barge_in_enabled !== undefined)
+          setBargeInEnabled(data.config.barge_in_enabled);
+        if (data.config.browser_stt_enabled !== undefined)
+          setBrowserSTTEnabled(data.config.browser_stt_enabled);
+        return;
+      }
+
+      if (data.type === "agent_ready") {
+        console.log("[AGENT] Agent is ready");
+        setIsAgentReady(true);
+        return;
+      }
+
+      if (data.type === "text" && data.text) {
+        // Filter stale text?
+        if (shouldIgnoreAudioRef.current) {
+          console.log("[BARGE-IN] Ignoring stale text:", data.text);
+          return;
+        }
+        console.log("Agent text:", data.text);
+      }
+
+      if (data.type === "audio" && data.audio) {
+        // Ignore audio if we're in barge-in stop mode
+        if (shouldIgnoreAudioRef.current) {
+          return;
+        }
+
+        // Decode base64
+        const binaryString = atob(data.audio);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        // --- STRATEGY: MSE (MP3) ---
+        if (currentFormatRef.current === "mp3") {
+          // Self-healing: If we missed audio_start, or just restarted, init MSE now
+          if (!mediaSourceRef.current) {
+            console.log("[MSE] Lazy init triggered by audio chunk");
+            initMSE();
+          }
+
+          mseQueueRef.current.push(bytes);
+          processMSEQueue();
+
+          // Update UI state
+          if (!isPlayingRef.current) {
+            isPlayingRef.current = true;
+            setIsPlaying(true);
+          }
+          // Reset UI state timer? MSE plays audio element.
+          // We can listen to 'ended' on audio element if streaming stops.
+          // But streaming implies continuous. For visualization, we just keep it on while receiving?
+
+          // Hack for Orb: Set timeout to turn off if no chunks
+          if (playbackTimeoutRef.current)
+            clearTimeout(playbackTimeoutRef.current);
+          playbackTimeoutRef.current = window.setTimeout(() => {
+            setIsPlaying(false);
+            isPlayingRef.current = false;
+          }, 1000); // 1s buffer?
+        } else {
+          // --- STRATEGY: AudioContext (PCM/WAV) ---
+          // Init context if needed (safeguard)
+          const ctx = initAudioContext();
+
+          // Handle raw PCM wrapping if needed
+          let finalBuffer: any = bytes;
+          if (currentFormatRef.current === "pcm_s16le") {
+            // Basic check for RIFF header to avoid double wrapping
+            if (
+              !(bytes.length >= 4 && bytes[0] === 0x52 && bytes[1] === 0x49)
+            ) {
+              finalBuffer = addWavHeader(bytes as any, 44100);
+            }
+          }
+
+          // Decode and Schedule
+          ctx.decodeAudioData(
+            finalBuffer.buffer as ArrayBuffer,
+            (decodedBuffer) => {
+              const now = ctx.currentTime;
+              // Schedule for next available slot, or now if we fell behind
+              const startTime = Math.max(now, nextStartTimeRef.current);
+
+              const source = ctx.createBufferSource();
+              source.buffer = decodedBuffer;
+              source.connect(ctx.destination);
+              source.start(startTime);
+
+              // Update next start time
+              nextStartTimeRef.current = startTime + decodedBuffer.duration;
+
+              // UI State
+              isPlayingRef.current = true;
+              setIsPlaying(true);
+
+              // Auto-reset isPlaying state when this chunk ends (approx)
+              // Ideally we track active sources, but for UI visualizer simple timeout is okay
+              // Or checks in animation loop.
+              source.onended = () => {
+                if (ctx.currentTime >= nextStartTimeRef.current - 0.1) {
+                  isPlayingRef.current = false;
+                  setIsPlaying(false);
+                }
+              };
+            },
+            (err) => {
+              console.error("Audio decode error:", err);
+            }
+          );
+        }
+      }
+    } catch (e) {
+      console.error("Failed to parse data channel message:", e);
+    }
+  });
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+    };
+  }, []);
+
+  // Browser Native STT Logic
+  useEffect(() => {
+    if (
+      browserSTTEnabled &&
+      isConnected &&
+      "webkitSpeechRecognition" in window
+    ) {
+      console.log("[BROWSER-STT] Initializing Speech Recognition");
+      // @ts-ignore
+      const recognition = new window.webkitSpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      recognition.lang = "en-US";
+
+      recognition.onstart = () => {
+        console.log("[BROWSER-STT] Started listening");
+        isRecognitionRunningRef.current = true;
+      };
+
+      recognition.onerror = (event: any) => {
+        console.error("[BROWSER-STT] Error:", event.error);
+      };
+
+      recognition.onend = () => {
+        console.log("[BROWSER-STT] Ended");
+        isRecognitionRunningRef.current = false;
+        // Auto-restart if still enabled
+        if (browserSTTEnabled && isConnected) {
+          console.log("[BROWSER-STT] Restarting...");
+          try {
+            recognition.start();
+          } catch (e) {}
+        }
+      };
+
+      recognition.onresult = (event: any) => {
+        const transcript =
+          event.results[event.results.length - 1][0].transcript;
+        console.log("[BROWSER-STT] Recognized:", transcript);
+
+        if (transcript.trim().length > 0) {
+          // Send to backend via Data Channel
+          const msg = JSON.stringify({ type: "chat_input", text: transcript });
+          const encoder = new TextEncoder();
+          const payload = encoder.encode(msg);
+
+          if (localParticipant) {
+            localParticipant.publishData(payload, { reliable: true });
+          }
+        }
+      };
+
+      recognitionRef.current = recognition;
+      try {
+        recognition.start();
+      } catch (e) {
+        console.error(e);
+      }
+
+      return () => {
+        if (recognitionRef.current) {
+          recognitionRef.current.stop();
+          recognitionRef.current = null;
+        }
+      };
+    }
+  }, [browserSTTEnabled, isConnected, localParticipant]);
+
+  // Local VAD (Voice Activity Detection) for instant barge-in
+  useEffect(() => {
+    if (!isConnected || localTracks.length === 0) return;
+
+    const track = localTracks[0]?.publication?.track;
+    if (!track || !track.mediaStreamTrack) return;
+
+    const audioContext = new AudioContext();
+    const mediaStream = new MediaStream([track.mediaStreamTrack]);
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+
+    source.connect(analyser);
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    let animationId: number;
+    let speakingFrames = 0;
+
+    const checkAudioLevel = () => {
+      analyser.getByteFrequencyData(dataArray);
+      const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+      // Threshold 45 is sensitive, but we require sustained speech (e.g. 5 frames ~ 80ms)
+      const isActuallyPlaying =
+        isPlayingRef.current ||
+        (currentAudioRef.current && !currentAudioRef.current.paused);
+
+      // IMPORTANT: Don't re-trigger if we are already ignoring audio (barge-in active)
+      if (
+        bargeInEnabled &&
+        isActuallyPlaying &&
+        !shouldIgnoreAudioRef.current
+      ) {
+        // Debug log every ~100 frames (approx 1.5s) to check mic levels
+        if (speakingFrames === 0 && Math.random() < 0.01) {
+          console.log(`[LOCAL-VAD] Current mic level: ${average.toFixed(2)}`);
+        }
+
+        if (average > 45) {
+          speakingFrames++;
+        } else {
+          speakingFrames = 0;
+        }
+
+        if (speakingFrames > 5) {
+          console.log(
+            `[LOCAL-VAD] Sustained speech detected (level: ${average.toFixed(
+              2
+            )}), stopping audio`
+          );
+          stopAllAudio();
+          speakingFrames = 0; // Reset
+        }
       }
 
       animationId = requestAnimationFrame(checkAudioLevel);
@@ -377,48 +715,6 @@ function VoiceUI() {
       audioContext.close();
     };
   }, [isConnected, localTracks, stopAllAudio, bargeInEnabled]);
-
-  // Play combined audio using Audio element
-  const playNextInQueue = () => {
-    if (playbackQueueRef.current.length === 0) {
-      isPlayingRef.current = false;
-      setIsPlaying(false);
-      return;
-    }
-
-    isPlayingRef.current = true;
-    setIsPlaying(true);
-
-    const audioUrl = playbackQueueRef.current.shift()!;
-
-    // Create audio element with blob URL
-    const audio = new Audio(audioUrl);
-    currentAudioRef.current = audio;
-
-    audio.onended = () => {
-      console.log("Audio playback finished");
-      // Revoke the blob URL to free memory
-      URL.revokeObjectURL(audioUrl);
-      playNextInQueue();
-    };
-
-    audio.onerror = (e) => {
-      console.error("Audio playback error:", e);
-      URL.revokeObjectURL(audioUrl);
-      playNextInQueue();
-    };
-
-    audio
-      .play()
-      .then(() => {
-        console.log("Playing combined audio");
-      })
-      .catch((e) => {
-        console.error("Failed to play audio:", e);
-        URL.revokeObjectURL(audioUrl);
-        playNextInQueue();
-      });
-  };
 
   return (
     <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">

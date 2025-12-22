@@ -39,11 +39,11 @@ func (e *ElevenLabsClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// SendText queues text for TTS. For simplicity, we now use a synchronous approach
-// where each call creates a fresh connection, sends text, and reads all audio.
+// SendText queues text for TTS.
+// Updated to be synchronous (blocking) to ensure sequential processing for streaming
 func (e *ElevenLabsClient) SendText(text string) error {
 	e.interrupted.Store(false) // Reset interrupt flag for new request
-	go e.speakAsync(text)
+	e.speakAsync(text)
 	return nil
 }
 

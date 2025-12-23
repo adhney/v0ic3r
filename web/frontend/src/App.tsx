@@ -143,6 +143,39 @@ function VoiceUI() {
     if (!currentAudioRef.current) {
       const audio = new Audio();
       currentAudioRef.current = audio;
+
+      // Track actual audio playback state via events
+      audio.addEventListener("playing", () => {
+        console.log("[AUDIO-ELEMENT] playing event");
+        isPlayingRef.current = true;
+        setIsPlaying(true);
+        // Clear any pending timeout since we're actually playing
+        if (playbackTimeoutRef.current)
+          clearTimeout(playbackTimeoutRef.current);
+      });
+      audio.addEventListener("waiting", () => {
+        console.log("[AUDIO-ELEMENT] waiting for data (buffering)");
+        // Don't turn blue while buffering - keep green
+      });
+      audio.addEventListener("pause", () => {
+        console.log("[AUDIO-ELEMENT] paused");
+        // Only turn blue if actually paused (not just buffering)
+        // Use a short delay to avoid flickering during natural pauses
+        if (playbackTimeoutRef.current)
+          clearTimeout(playbackTimeoutRef.current);
+        playbackTimeoutRef.current = window.setTimeout(() => {
+          if (currentAudioRef.current?.paused) {
+            isPlayingRef.current = false;
+            setIsPlaying(false);
+          }
+        }, 500);
+      });
+      audio.addEventListener("ended", () => {
+        console.log("[AUDIO-ELEMENT] ended");
+        isPlayingRef.current = false;
+        setIsPlaying(false);
+      });
+
       audio.src = URL.createObjectURL(ms);
       audio.play().catch((e) => console.error("MSE Play error:", e));
     } else {
@@ -430,12 +463,25 @@ function VoiceUI() {
         return;
       }
 
+      if (data.type === "audio_end") {
+        // Note: Backend sends audio_end per sentence, not per full response.
+        // So we don't reset isPlaying here - we use a debounce timeout instead.
+        console.log(
+          "[AUDIO] audio_end received (per-sentence marker, ignoring for UI)"
+        );
+        return;
+      }
+
       if (data.type === "audio_start") {
         // New audio stream starting, accept audio again
         console.log("[AUDIO] audio_start received, starting playback");
         shouldIgnoreAudioRef.current = false;
         if (bargeInResetTimerRef.current)
           clearTimeout(bargeInResetTimerRef.current);
+
+        // Clear any pending playback timeout from a previous sentence
+        if (playbackTimeoutRef.current)
+          clearTimeout(playbackTimeoutRef.current);
 
         const format = data.format || "mp3";
         currentFormatRef.current = format;
@@ -510,13 +556,8 @@ function VoiceUI() {
           // We can listen to 'ended' on audio element if streaming stops.
           // But streaming implies continuous. For visualization, we just keep it on while receiving?
 
-          // Hack for Orb: Set timeout to turn off if no chunks
-          if (playbackTimeoutRef.current)
-            clearTimeout(playbackTimeoutRef.current);
-          playbackTimeoutRef.current = window.setTimeout(() => {
-            setIsPlaying(false);
-            isPlayingRef.current = false;
-          }, 1000); // 1s buffer?
+          // isPlaying state is now tracked via audio element events (playing, pause, ended)
+          // No need for timeout-based detection here
         } else {
           // --- STRATEGY: AudioContext (PCM/WAV) ---
           // Init context if needed (safeguard)
@@ -731,12 +772,7 @@ function VoiceUI() {
         <p className="text-zinc-400 text-sm">Powered by LiveKit</p>
       </div>
 
-      {/* Main Connection Check */}
-      {!isConnected && (
-        <div className="text-zinc-500 animate-pulse text-sm">
-          Connecting to server...
-        </div>
-      )}
+      {/* Connection status is now shown in the status text area below */}
 
       {/* Voice Visualizer Orb */}
       <div className="relative w-64 h-64 flex items-center justify-center -my-10">
@@ -745,28 +781,26 @@ function VoiceUI() {
 
       {/* Status Text */}
       <div className="mt-12 text-center h-8">
-        {isConnected && (
-          <div
-            className={`transition-all duration-300 ${
-              isPlaying ? "text-emerald-400" : "text-zinc-400"
-            }`}
-          >
-            {isPlaying ? (
-              <span className="flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                Speaking...
-              </span>
-            ) : (
-              <span
-                className={`text-sm ${
-                  isAgentReady ? "text-blue-400 animate-pulse" : "text-zinc-500"
-                }`}
-              >
-                {isAgentReady ? "Listening..." : "Connecting..."}
-              </span>
-            )}
-          </div>
-        )}
+        <div
+          className={`transition-all duration-300 ${
+            isPlaying ? "text-emerald-400" : "text-zinc-400"
+          }`}
+        >
+          {isPlaying ? (
+            <span className="flex items-center gap-2 justify-center">
+              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+              Speaking...
+            </span>
+          ) : isConnected && isAgentReady ? (
+            <span className="text-sm text-blue-400 animate-pulse">
+              Listening...
+            </span>
+          ) : (
+            <span className="text-sm text-zinc-400 animate-pulse">
+              Connecting...
+            </span>
+          )}
+        </div>
       </div>
 
       {/* End Call Button */}

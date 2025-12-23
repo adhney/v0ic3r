@@ -148,15 +148,15 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: a.onTrackSubscribed,
 			OnTrackUnsubscribed: func(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				log.Printf("Track unsubscribed from %s", rp.Identity())
+				// Verbose log removed
 			},
 			OnDataReceived: a.onDataPacket,
 		},
 		OnParticipantConnected: func(rp *lksdk.RemoteParticipant) {
-			log.Printf("Participant connected: %s", rp.Identity())
+			// Verbose log removed
 		},
 		OnParticipantDisconnected: func(rp *lksdk.RemoteParticipant) {
-			log.Printf("Participant disconnected: %s", rp.Identity())
+			// Verbose log removed
 		},
 	}
 
@@ -209,7 +209,7 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 	})
 	// Signal to frontend that agent is fully ready
 	a.sendAudioControl("agent_ready", nil)
-	log.Printf("[AGENT] Sent agent_ready signal to frontend (BargeIn: %v)", a.enableBargeIn)
+	// Agent ready signal sent silently
 
 	return nil
 }
@@ -231,7 +231,7 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 				a.isPlaying = false
 				a.mu.Unlock()
 				a.sendAudioControl("audio_end")
-				log.Printf("[AUDIO-CONTROL] Audio playback ended")
+				// Audio ended signal sent
 				continue
 			}
 
@@ -239,7 +239,7 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 			a.mu.Lock()
 			if a.interruptPlayback {
 				a.mu.Unlock()
-				log.Printf("[BARGE-IN] Audio interrupted, skipping chunk")
+				// Barge-in: skipping chunk
 				continue
 			}
 
@@ -252,7 +252,7 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 			}
 			a.mu.Unlock()
 
-			log.Printf("Sending TTS audio via data channel: %d bytes", len(pcmData))
+			// Sending TTS audio chunk
 
 			// Determine format based on provider
 			format := "mp3"
@@ -285,7 +285,7 @@ func (a *VoiceAgent) sendTTSAudioViaDataChannel() {
 				if err != nil {
 					log.Printf("Failed to send data packet: %v", err)
 				} else {
-					log.Printf("Sent audio data packet: %d bytes", len(jsonData))
+					// Audio packet sent
 					// Track when we last sent audio for smart barge-in
 					a.mu.Lock()
 					a.lastAudioSentTime = time.Now()
@@ -317,7 +317,7 @@ func (a *VoiceAgent) sendAudioControl(controlType string, config ...map[string]i
 			lksdk.WithDataPublishReliable(true),
 			lksdk.WithDataPublishTopic("audio"),
 		)
-		log.Printf("[AUDIO-CONTROL] Sent %s", controlType)
+		// Audio control sent
 	}
 }
 
@@ -374,8 +374,8 @@ func (a *VoiceAgent) triggerInterrupt() {
 		// Drain the TTS sentence queue so pending sentences aren't spoken
 		for {
 			select {
-			case job := <-a.ttsQueue:
-				log.Printf("[BARGE-IN] Discarded queued sentence: %q", job.text)
+			case <-a.ttsQueue:
+				// Discarded queued sentence
 			default:
 				goto done
 			}
@@ -383,13 +383,13 @@ func (a *VoiceAgent) triggerInterrupt() {
 	done:
 		// Notify frontend to stop audio
 		a.sendAudioControl("audio_stop")
-		log.Printf("[BARGE-IN] Interrupt triggered, TTS cancelled, transcript cleared")
+		// Barge-in interrupt triggered
 
 		a.mu.Lock()
 		a.interruptPlayback = false
 		// Increment generation ID to invalidate any remaining TTS jobs from old generation
 		a.currentGenID++
-		log.Printf("[BARGE-IN] Incremented generation ID to %d", a.currentGenID)
+		// Generation ID incremented
 		// Don't manually reset isProcessing - let the cancelled request's defer handle it
 		// to prevent race conditions where new request starts before old one finishes cleanup
 		a.lastInterruptTime = time.Now() // Track when barge-in occurred
@@ -408,18 +408,8 @@ func (a *VoiceAgent) listenForSpeechStart() {
 			return
 		case <-a.sttClient.SpeechStarted:
 			a.mu.Lock()
-			isPlaying := a.isPlaying
+			_ = a.isPlaying // SpeechStarted events handled silently
 			a.mu.Unlock()
-
-			log.Printf("[BARGE-IN-DEBUG] SpeechStarted event received. isPlaying=%v", isPlaying)
-
-			if isPlaying {
-				// log.Printf("[BARGE-IN] User started speaking while TTS playing, triggering interrupt")
-				// a.triggerInterrupt()
-				log.Printf("[BARGE-IN-DEBUG] SpeechStarted detected but backend interrupt DISABLED (relying on frontend VAD)")
-			} else {
-				log.Printf("[BARGE-IN-DEBUG] Ignored SpeechStarted because isPlaying=false")
-			}
 		}
 	}
 }
@@ -443,7 +433,7 @@ func (a *VoiceAgent) processTranscripts() {
 		// If already processing, skip (don't interrupt - let it complete)
 		if a.isProcessing {
 			a.mu.Unlock()
-			log.Printf("[DEDUP] Skipping processing, already in progress")
+			// Skipping duplicate processing
 			return
 		}
 		a.isProcessing = true

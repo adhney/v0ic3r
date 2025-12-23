@@ -406,13 +406,13 @@ function VoiceUI() {
           console.log(`[LOCAL-VAD] Current mic level: ${average.toFixed(2)}`);
         }
 
-        if (average > 45) {
+        if (average > 55) {
           speakingFrames++;
         } else {
           speakingFrames = 0;
         }
 
-        if (speakingFrames > 5) {
+        if (speakingFrames > 10) {
           console.log(
             `[LOCAL-VAD] Sustained speech detected (level: ${average.toFixed(
               2
@@ -734,13 +734,13 @@ function VoiceUI() {
           console.log(`[LOCAL-VAD] Current mic level: ${average.toFixed(2)}`);
         }
 
-        if (average > 45) {
+        if (average > 55) {
           speakingFrames++;
         } else {
           speakingFrames = 0;
         }
 
-        if (speakingFrames > 5) {
+        if (speakingFrames > 10) {
           console.log(
             `[LOCAL-VAD] Sustained speech detected (level: ${average.toFixed(
               2

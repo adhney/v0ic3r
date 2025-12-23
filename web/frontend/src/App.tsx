@@ -763,13 +763,13 @@ function VoiceUI() {
   }, [isConnected, localTracks, stopAllAudio, bargeInEnabled]);
 
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">
+    <div className="min-h-screen bg-zinc-900 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">
       {/* Header */}
       <div className="text-center mb-8 space-y-2">
-        <h1 className="text-3xl font-semibold tracking-tight">
+        <h1 className="text-5xl font-bold tracking-tight bg-gradient-to-r from-white via-blue-100 to-blue-200 bg-clip-text text-transparent">
           Voice Assistant
         </h1>
-        <p className="text-zinc-400 text-sm">Powered by LiveKit</p>
+        <p className="text-zinc-400 text-sm font-medium">Powered by LiveKit</p>
       </div>
 
       {/* Connection status is now shown in the status text area below */}
@@ -849,15 +849,17 @@ function App() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">
+    <div className="min-h-screen bg-zinc-900 flex flex-col items-center justify-center p-8 font-sans text-zinc-100">
       {/* Show Connect Screen only if no token */}
       {!tokenData && (
         <>
           <div className="text-center mb-8 space-y-2">
-            <h1 className="text-3xl font-semibold tracking-tight">
+            <h1 className="text-5xl font-bold tracking-tight bg-gradient-to-r from-white via-blue-100 to-blue-200 bg-clip-text text-transparent">
               Voice Assistant
             </h1>
-            <p className="text-zinc-400 text-sm">Powered by LiveKit</p>
+            <p className="text-zinc-400 text-sm font-medium">
+              Powered by LiveKit
+            </p>
           </div>
 
           {!isLoading && (

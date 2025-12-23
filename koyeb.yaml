@@ -1,0 +1,31 @@
+service:
+  name: voice-agent-app
+  type: web
+  image: docker.io/library/voice-agent:latest # This will be replaced by your actual image if pulling from registry, or built from git
+
+  # Configuration for building from git (if connected via git)
+  build:
+    dockerfile: Dockerfile
+
+  # Instance size
+  instance_type: nano
+
+  # Ports
+  ports:
+    - port: 8080
+      path: /
+      protocol: http
+
+  # Environment variables (secrets should be set in dashboard)
+  env:
+    TTS_PROVIDER: "elevenlabs"
+    ENABLE_BARGE_IN: "true"
+    ENABLE_BROWSER_STT: "false"
+
+  # Health checks
+  health_checks:
+    - protocol: http
+      port: 8080
+      path: /
+      interval: 30
+      timeout: 5

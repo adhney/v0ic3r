@@ -1,0 +1,25 @@
+# Git and Docker
+.git
+.gitignore
+.dockerignore
+
+# Dependencies
+node_modules
+vendor
+
+# Build output
+dist
+bin
+tmp
+
+# Environment variables
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode
+.idea

@@ -18,6 +18,13 @@ interface TokenData {
   url: string;
 }
 
+// iOS Check
+const isIOS =
+  typeof window !== "undefined" &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) &&
+  !(window as any).MSStream;
+
 interface AudioMessage {
   type:
     | "audio"
@@ -119,10 +126,13 @@ function VoiceUI({ audioContext }: VoiceUIProps) {
   const bargeInResetTimerRef = useRef<number | null>(null); // Safety timer
 
   // Initialize AudioContext
+  // Initialize AudioContext
   const initAudioContext = useCallback(() => {
     // If we were passed a pre-created context (from click handler), use it first
     if (!audioContextRef.current && audioContext) {
       audioContextRef.current = audioContext;
+      // Initialize start time relative to this context
+      nextStartTimeRef.current = audioContextRef.current.currentTime;
     }
 
     if (
@@ -131,16 +141,82 @@ function VoiceUI({ audioContext }: VoiceUIProps) {
     ) {
       audioContextRef.current = new (window.AudioContext ||
         (window as any).webkitAudioContext)();
+      nextStartTimeRef.current = audioContextRef.current.currentTime;
     }
 
-    // Always update the reference time
-    nextStartTimeRef.current = audioContextRef.current.currentTime;
+    // DO NOT reset nextStartTimeRef.current here on every call.
+    // It should grow as chunks are scheduled.
 
     if (audioContextRef.current.state === "suspended") {
       audioContextRef.current.resume();
     }
     return audioContextRef.current;
   }, [audioContext]);
+
+  // Sequential Processing Queue
+  const isProcessingQueueRef = useRef(false);
+  const audioQueueRef = useRef<Uint8Array[]>([]);
+
+  const processAudioQueue = useCallback(async () => {
+    if (isProcessingQueueRef.current || audioQueueRef.current.length === 0)
+      return;
+
+    isProcessingQueueRef.current = true;
+    const ctx = initAudioContext();
+
+    try {
+      while (audioQueueRef.current.length > 0) {
+        const bytes = audioQueueRef.current.shift()!;
+
+        let finalBuffer: any = bytes;
+        // Handle raw PCM wrapping if needed
+        if (currentFormatRef.current === "pcm_s16le") {
+          if (!(bytes.length >= 4 && bytes[0] === 0x52 && bytes[1] === 0x49)) {
+            finalBuffer = addWavHeader(bytes as any, 44100);
+          }
+        }
+
+        try {
+          // Await decode to ensure serial scheduling
+          const decodedBuffer = await ctx.decodeAudioData(
+            finalBuffer.buffer as ArrayBuffer
+          );
+
+          const now = ctx.currentTime;
+          // Schedule for next available slot, or now if we fell behind
+          // Add a small buffer (0.05s) to prevent 'glitching' if we are too tight
+          const startTime = Math.max(now, nextStartTimeRef.current);
+
+          const source = ctx.createBufferSource();
+          source.buffer = decodedBuffer;
+          source.connect(ctx.destination);
+          source.start(startTime);
+
+          // Update next start time
+          nextStartTimeRef.current = startTime + decodedBuffer.duration;
+
+          // UI State
+          isPlayingRef.current = true;
+          setIsPlaying(true);
+
+          source.onended = () => {
+            if (ctx.currentTime >= nextStartTimeRef.current - 0.1) {
+              isPlayingRef.current = false;
+              setIsPlaying(false);
+            }
+          };
+        } catch (e) {
+          console.error("Audio decode error:", e);
+        }
+      }
+    } finally {
+      isProcessingQueueRef.current = false;
+      // Check if more items arrived while we were processing
+      if (audioQueueRef.current.length > 0) {
+        processAudioQueue();
+      }
+    }
+  }, [initAudioContext]);
 
   // Initialize MSE
   const initMSE = useCallback(() => {
@@ -503,7 +579,9 @@ function VoiceUI({ audioContext }: VoiceUIProps) {
         setIsPlaying(true);
 
         // Pick strategy
-        if (format === "mp3") {
+        // --- STRATEGY: MSE (MP3) ---
+        // MSE is disabled on iOS because it lacks full MP3 MediaSource support
+        if (currentFormatRef.current === "mp3" && !isIOS) {
           initMSE();
         } else {
           initAudioContext();
@@ -549,7 +627,8 @@ function VoiceUI({ audioContext }: VoiceUIProps) {
         }
 
         // --- STRATEGY: MSE (MP3) ---
-        if (currentFormatRef.current === "mp3") {
+        // MSE is disabled on iOS because it lacks full MP3 MediaSource support
+        if (currentFormatRef.current === "mp3" && !isIOS) {
           // Self-healing: If we missed audio_start, or just restarted, init MSE now
           if (!mediaSourceRef.current) {
             console.log("[MSE] Lazy init triggered by audio chunk");
@@ -573,53 +652,11 @@ function VoiceUI({ audioContext }: VoiceUIProps) {
         } else {
           // --- STRATEGY: AudioContext (PCM/WAV) ---
           // Init context if needed (safeguard)
-          const ctx = initAudioContext();
+          initAudioContext();
 
-          // Handle raw PCM wrapping if needed
-          let finalBuffer: any = bytes;
-          if (currentFormatRef.current === "pcm_s16le") {
-            // Basic check for RIFF header to avoid double wrapping
-            if (
-              !(bytes.length >= 4 && bytes[0] === 0x52 && bytes[1] === 0x49)
-            ) {
-              finalBuffer = addWavHeader(bytes as any, 44100);
-            }
-          }
-
-          // Decode and Schedule
-          ctx.decodeAudioData(
-            finalBuffer.buffer as ArrayBuffer,
-            (decodedBuffer) => {
-              const now = ctx.currentTime;
-              // Schedule for next available slot, or now if we fell behind
-              const startTime = Math.max(now, nextStartTimeRef.current);
-
-              const source = ctx.createBufferSource();
-              source.buffer = decodedBuffer;
-              source.connect(ctx.destination);
-              source.start(startTime);
-
-              // Update next start time
-              nextStartTimeRef.current = startTime + decodedBuffer.duration;
-
-              // UI State
-              isPlayingRef.current = true;
-              setIsPlaying(true);
-
-              // Auto-reset isPlaying state when this chunk ends (approx)
-              // Ideally we track active sources, but for UI visualizer simple timeout is okay
-              // Or checks in animation loop.
-              source.onended = () => {
-                if (ctx.currentTime >= nextStartTimeRef.current - 0.1) {
-                  isPlayingRef.current = false;
-                  setIsPlaying(false);
-                }
-              };
-            },
-            (err) => {
-              console.error("Audio decode error:", err);
-            }
-          );
+          // Push to queue and process
+          audioQueueRef.current.push(bytes);
+          processAudioQueue();
         }
       }
     } catch (e) {
@@ -848,6 +885,20 @@ function App() {
       if (ctx.state === "suspended") {
         await ctx.resume();
       }
+
+      // iOS "Wake Up" Trick: Play a silent buffer immediately
+      // This forces the audio unlock on some stubborn iOS versions
+      try {
+        const buffer = ctx.createBuffer(1, 1, 22050);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.start(0);
+        console.log("[AudioContext] Silent buffer played to wake up engine");
+      } catch (e) {
+        console.error("[AudioContext] Failed to play silent buffer:", e);
+      }
+
       setPreloadedAudioContext(ctx);
 
       const response = await fetch("/api/livekit/token", {

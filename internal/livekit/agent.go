@@ -211,6 +211,18 @@ func (a *VoiceAgent) Start(ctx context.Context) error {
 	a.sendAudioControl("agent_ready", nil)
 	// Agent ready signal sent silently
 
+	// Send initial greeting after a short delay to ensure everything is initialized
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		initialGreeting := "Hi! Welcome! What can I do for you today? Are you looking to book an appointment, learn about a doctor, or something else?"
+		select {
+		case a.ttsQueue <- ttsJob{text: initialGreeting, generationID: 0, ctx: a.ctx}:
+			log.Printf("[TTS-STREAM] Queued initial greeting")
+		case <-a.ctx.Done():
+			return
+		}
+	}()
+
 	return nil
 }
 

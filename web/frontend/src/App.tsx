@@ -83,7 +83,11 @@ function writeString(view: DataView, offset: number, string: string) {
 // Module-level deduplication for Strict Mode compatibility
 let lastGlobalMessagePayload = "";
 
-function VoiceUI() {
+interface VoiceUIProps {
+  audioContext: AudioContext | null;
+}
+
+function VoiceUI({ audioContext }: VoiceUIProps) {
   const connectionState = useConnectionState();
   const localTracks = useTracks([Track.Source.Microphone]);
   const { localParticipant } = useLocalParticipant();
@@ -116,19 +120,27 @@ function VoiceUI() {
 
   // Initialize AudioContext
   const initAudioContext = useCallback(() => {
+    // If we were passed a pre-created context (from click handler), use it first
+    if (!audioContextRef.current && audioContext) {
+      audioContextRef.current = audioContext;
+    }
+
     if (
       !audioContextRef.current ||
       audioContextRef.current.state === "closed"
     ) {
       audioContextRef.current = new (window.AudioContext ||
         (window as any).webkitAudioContext)();
-      nextStartTimeRef.current = audioContextRef.current.currentTime;
     }
+
+    // Always update the reference time
+    nextStartTimeRef.current = audioContextRef.current.currentTime;
+
     if (audioContextRef.current.state === "suspended") {
       audioContextRef.current.resume();
     }
     return audioContextRef.current;
-  }, []);
+  }, [audioContext]);
 
   // Initialize MSE
   const initMSE = useCallback(() => {
@@ -820,11 +832,23 @@ function App() {
   const [tokenData, setTokenData] = useState<TokenData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [preloadedAudioContext, setPreloadedAudioContext] =
+    useState<AudioContext | null>(null);
 
   const connect = useCallback(async () => {
     try {
       setIsLoading(true);
       setError(null);
+
+      // iOS SAFARI FIX: Create and resume AudioContext immediately inside the click handler
+      // This is crucial for audio playback permissions on iOS
+      const AudioContextClass =
+        window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioContextClass();
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+      setPreloadedAudioContext(ctx);
 
       const response = await fetch("/api/livekit/token", {
         method: "POST",
@@ -894,7 +918,7 @@ function App() {
           onDisconnected={disconnect}
           className="w-full h-full"
         >
-          <VoiceUI />
+          <VoiceUI audioContext={preloadedAudioContext} />
           <RoomAudioRenderer />
         </LiveKitRoom>
       )}

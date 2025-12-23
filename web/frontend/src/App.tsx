@@ -889,7 +889,7 @@ function App() {
       // iOS "Wake Up" Trick: Play a silent buffer immediately
       // This forces the audio unlock on some stubborn iOS versions
       try {
-        const buffer = ctx.createBuffer(1, 1, 22050);
+        const buffer = ctx.createBuffer(1, 44100 * 0.2, 44100); // 200ms of silence
         const source = ctx.createBufferSource();
         source.buffer = buffer;
         source.connect(ctx.destination);

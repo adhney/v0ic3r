@@ -9,12 +9,10 @@ This project demonstrates a production-grade voice agent capable of handling com
 ## 🎥 Demo
 
 <div align="center">
-  <a href="web/frontend/public/demo.mp4">
-    <img src="web/frontend/public/demo-thumbnail.jpg" alt="Voice Agent Demo" width="100%">
-  </a>
+  <video src="web/frontend/public/demo.mp4" controls width="100%"></video>
 </div>
 
-> **Note**: Click the image above to view the demo (download required on some browsers).
+> **Note**: If the video doesn't play, you can [download it here](web/frontend/public/demo.mp4).
 
 ## ✨ Features
 
@@ -32,18 +30,24 @@ The system uses **LiveKit** for real-time WebRTC transport, orchestrating stream
 
 ```mermaid
 flowchart TD
-    User["📱 User (Browser/Mobile)"] <-->|WebRTC (LiveKit)| Backend["🚀 Go Backend"]
+    User["📱 User (Browser/Mobile)"]
+    Backend["🚀 Go Backend"]
+    Deepgram["Deepgram Nova-3"]
+    Gemini["Gemini 2.0 Flash"]
+    ElevenLabs["ElevenLabs v2.5"]
 
-    Backend -->|Stream Audio| Deepgram[Deepgram Nova-3]
-    Deepgram -->|Text| Backend
+    User <-->|"WebRTC (LiveKit)"| Backend
 
-    Backend -->|Context + Prompt| Gemini[Gemini 2.0 Flash]
-    Gemini -->|Streaming Response| Backend
+    Backend -->|"Stream Audio"| Deepgram
+    Deepgram -->|"Text"| Backend
 
-    Backend -->|Text Stream| ElevenLabs[ElevenLabs v2.5]
-    ElevenLabs -->|Audio Chunks| Backend
+    Backend -->|"Context + Prompt"| Gemini
+    Gemini -->|"Streaming Response"| Backend
 
-    Backend -->|Audio Stream| User
+    Backend -->|"Text Stream"| ElevenLabs
+    ElevenLabs -->|"Audio Chunks"| Backend
+
+    Backend -->|"Audio Stream"| User
 ```
 
 ## 🛠️ Tech Stack

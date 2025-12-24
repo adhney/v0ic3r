@@ -7,10 +7,12 @@ This project demonstrates a production-grade voice agent capable of handling com
 ## 🎥 Demo
 
 <div align="center">
-  <video src="web/frontend/public/demo.mov" width="100%" controls="controls" muted="muted"></video>
+  <a href="web/frontend/public/demo.mov">
+    <img src="web/frontend/public/demo-thumbnail.jpg" alt="Voice Agent Demo" width="100%">
+  </a>
 </div>
 
-> **Note**: If the video above doesn't play, you can [download it here](web/frontend/public/demo.mov).
+> **Note**: Click the image above to view the demo (download required on some browsers).
 
 ## ✨ Features
 
@@ -27,7 +29,7 @@ This project demonstrates a production-grade voice agent capable of handling com
 The system uses **LiveKit** for real-time WebRTC transport, orchestrating streams between the user and the AI services.
 
 ```mermaid
-graph TD
+flowchart TD
     User["📱 User (Browser/Mobile)"] <-->|WebRTC (LiveKit)| Backend["🚀 Go Backend"]
 
     Backend -->|Stream Audio| Deepgram[Deepgram Nova-3]

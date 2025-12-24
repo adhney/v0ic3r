@@ -1,5 +1,7 @@
 # v0ic3r 🎙️
 
+[![Live Demo](https://img.shields.io/badge/Live_Demo-v0ic3r.adhney.in-success?style=for-the-badge&logo=googlechrome&logoColor=white)](https://v0ic3r.adhney.in)
+
 A high-performance, real-time **Healthcare Voice Assistant** built with Go.
 
 This project demonstrates a production-grade voice agent capable of handling complex medical scheduling, triage, and FAQs with sub-second latency. It features instant "barge-in" interruption handling and full mobile compatibility.
@@ -7,7 +9,7 @@ This project demonstrates a production-grade voice agent capable of handling com
 ## 🎥 Demo
 
 <div align="center">
-  <a href="web/frontend/public/demo.mov">
+  <a href="web/frontend/public/demo.mp4">
     <img src="web/frontend/public/demo-thumbnail.jpg" alt="Voice Agent Demo" width="100%">
   </a>
 </div>

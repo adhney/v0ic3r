@@ -39,7 +39,6 @@ build/
 
 # Recordings and media
 *.webm
-*.mp4
 *.wav
 
 # Gemini/Claude artifacts (if any)

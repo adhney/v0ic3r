@@ -9,12 +9,10 @@ This project demonstrates a production-grade voice agent capable of handling com
 ## 🎥 Demo
 
 <div align="center">
-  <a href="web/frontend/public/demo.mp4">
+  <a href="https://v0ic3r.adhney.in/demo.mp4">
     <img src="web/frontend/public/demo-thumbnail.jpg" alt="Voice Agent Demo" width="100%">
   </a>
 </div>
-
-> **Note**: If the video doesn't play, you can [download it here](web/frontend/public/demo.mp4).
 
 ## ✨ Features
 

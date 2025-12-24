@@ -4,6 +4,14 @@ A high-performance, real-time **Healthcare Voice Assistant** built with Go.
 
 This project demonstrates a production-grade voice agent capable of handling complex medical scheduling, triage, and FAQs with sub-second latency. It features instant "barge-in" interruption handling and full mobile compatibility.
 
+## 🎥 Demo
+
+<div align="center">
+  <video src="web/frontend/public/demo.mov" width="100%" controls="controls" muted="muted"></video>
+</div>
+
+> **Note**: If the video above doesn't play, you can [download it here](web/frontend/public/demo.mov).
+
 ## ✨ Features
 
 - **🏥 Healthcare AI**: Pre-configured as a receptionist/scheduler for clinics.
@@ -20,7 +28,7 @@ The system uses **LiveKit** for real-time WebRTC transport, orchestrating stream
 
 ```mermaid
 graph TD
-    User[📱 User (Browser/Mobile)] <-->|WebRTC (LiveKit)| Backend[🚀 Go Backend]
+    User["📱 User (Browser/Mobile)"] <-->|WebRTC (LiveKit)| Backend["🚀 Go Backend"]
 
     Backend -->|Stream Audio| Deepgram[Deepgram Nova-3]
     Deepgram -->|Text| Backend
